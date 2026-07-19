@@ -18,25 +18,29 @@ selection, and unsaved actor changes.
 
 No third-party Python packages are required.
 
-## Running
+## Installation
 
-From this repository:
-
-```powershell
-python -m uepy nodes
-python -m uepy world
-python -m uepy selected
-```
-
-Optionally install an editable console command:
+Install the checkout once in editable mode:
 
 ```powershell
 python -m pip install -e .
-uepy world
 ```
 
-In a project that provides its own wrapper, use that wrapper instead. Peacebound
-provides `./uepy.ps1` at its repository root.
+This creates the `uepy` console command while keeping imports pointed at the
+checkout. Ordinary `.py` edits take effect immediately. Reinstall only after
+changing packaging metadata, dependencies, or console entry points in
+`pyproject.toml`, moving the checkout, or switching Python environments.
+
+Then run it from any directory:
+
+```powershell
+uepy nodes
+uepy world
+uepy selected
+```
+
+Without installation, `python -m uepy ...` remains available while the current
+directory is this repository.
 
 ## Inspection commands
 
