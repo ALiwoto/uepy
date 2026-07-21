@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import textwrap
 import time
 import uuid
 from pathlib import Path
@@ -174,11 +175,19 @@ class UnrealRemoteClient:
         """Execute an inspection body and decode its ``_uepy_result`` value."""
 
         marker = f"__UEPY_RESULT_{uuid.uuid4().hex}__"
+        # Keep every Unreal Python wrapper local to a short-lived function. Executing
+        # query bodies at module scope leaves actors, worlds, and packages rooted by
+        # FPyReferenceCollector and can make Unreal's editor map change leak check
+        # fatal. The function call releases those references after serialization.
+        scoped_body = textwrap.indent(body.rstrip(), "    ")
         wrapped = (
             "import json\n"
-            "_uepy_result = None\n"
-            f"{body.rstrip()}\n"
-            f"print({marker!r} + json.dumps(_uepy_result, ensure_ascii=False, separators=(',', ':')))\n"
+            "def _uepy_query_scope():\n"
+            "    _uepy_result = None\n"
+            f"{scoped_body}\n"
+            "    return _uepy_result\n"
+            f"print({marker!r} + json.dumps(_uepy_query_scope(), ensure_ascii=False, separators=(',', ':')))\n"
+            "del _uepy_query_scope\n"
         )
         response = self.execute(wrapped)
         for entry in response.get("output", []):
@@ -197,4 +206,3 @@ class UnrealRemoteClient:
         raise ProtocolError(
             "The Unreal command succeeded but did not return the expected inspection marker."
         )
-
