@@ -57,8 +57,10 @@ uepy mesh /Game/LevelPrototyping/Meshes/SM_Cube
 ```
 
 `descriptors` uses World Partition actor descriptors, so it can report actors
-that are not currently loaded. Result limits are capped at 25 because Epic's
-bundled remote client reads a command response into one small protocol buffer.
+that are not currently loaded. Result limits are capped at 100 to keep live
+main-thread inspection bounded. `uepy` patches UE 5.4's bundled TCP receiver at
+runtime so command-result JSON split across multiple network chunks is assembled
+before decoding; the installed engine files are never modified.
 
 Every inspection command emits JSON. Add `--compact` before the command for
 machine-oriented single-line output:

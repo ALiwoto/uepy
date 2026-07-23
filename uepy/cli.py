@@ -13,10 +13,15 @@ from .client import UnrealRemoteClient
 from .errors import UepyError
 
 
+MAX_INSPECTION_RESULTS = 100
+
+
 def _positive_limit(value: str) -> int:
     parsed = int(value)
-    if parsed < 1 or parsed > 25:
-        raise argparse.ArgumentTypeError("limit must be between 1 and 25")
+    if parsed < 1 or parsed > MAX_INSPECTION_RESULTS:
+        raise argparse.ArgumentTypeError(
+            f"limit must be between 1 and {MAX_INSPECTION_RESULTS}"
+        )
     return parsed
 
 
@@ -153,4 +158,3 @@ def main(argv: list[str] | None = None) -> int:
         print(f"uepy: error: {exc}", file=sys.stderr)
         return 1
     return 0
-

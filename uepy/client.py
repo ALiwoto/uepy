@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import textwrap
 import time
 import uuid
@@ -16,12 +17,91 @@ from .errors import DiscoveryError, ProtocolError, RemoteCommandError, UepyError
 from .locator import find_remote_execution
 
 
+_RECEIVE_CHUNK_SIZE = 64 * 1024
+_MAX_RESPONSE_SIZE = 64 * 1024 * 1024
+_INCOMPLETE_RESPONSE_TIMEOUT_SECONDS = 5.0
+
+
+def _receive_complete_json_bytes(command_socket: Any) -> bytes:
+    """Receive one complete JSON value from Epic's unframed TCP channel.
+
+    UE 5.4's bundled ``remote_execution.py`` performs one 8 KiB ``recv`` call.
+    TCP does not preserve message boundaries, so a valid command result may be
+    split across several receives. Commands are strictly request/response and
+    only one JSON value is in flight, which lets us stop once ``json.loads``
+    accepts the accumulated bytes.
+    """
+
+    response = bytearray()
+    original_timeout = command_socket.gettimeout() if hasattr(command_socket, "gettimeout") else None
+    timeout_changed = False
+    try:
+        while True:
+            try:
+                chunk = command_socket.recv(_RECEIVE_CHUNK_SIZE)
+            except (socket.timeout, TimeoutError) as exc:
+                raise RuntimeError(
+                    "Timed out while receiving an incomplete Unreal Python response."
+                ) from exc
+
+            if not chunk:
+                raise RuntimeError(
+                    "The Unreal Python command connection closed before its JSON response completed."
+                )
+
+            response.extend(chunk)
+            if len(response) > _MAX_RESPONSE_SIZE:
+                raise RuntimeError(
+                    f"Unreal Python response exceeded {_MAX_RESPONSE_SIZE // (1024 * 1024)} MiB."
+                )
+
+            try:
+                json.loads(response)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if not timeout_changed and hasattr(command_socket, "settimeout"):
+                    command_socket.settimeout(_INCOMPLETE_RESPONSE_TIMEOUT_SECONDS)
+                    timeout_changed = True
+                continue
+            return bytes(response)
+    finally:
+        if timeout_changed and hasattr(command_socket, "settimeout"):
+            command_socket.settimeout(original_timeout)
+
+
+def _install_chunked_receive(remote: ModuleType) -> None:
+    """Replace Epic's single-recv implementation while retaining its protocol."""
+
+    connection_type = getattr(remote, "_RemoteExecutionCommandConnection", None)
+    message_type = getattr(remote, "_RemoteExecutionMessage", None)
+    if connection_type is None or message_type is None:
+        raise UepyError(
+            "Epic's remote_execution.py no longer exposes the expected UE 5.4 protocol types."
+        )
+    if getattr(connection_type, "_uepy_chunked_receive", False):
+        return
+
+    def _receive_message(connection: Any, expected_type: str) -> Any:
+        data = _receive_complete_json_bytes(connection._command_channel_socket)
+        message = message_type(None, None)
+        if (
+            message.from_json_bytes(data)
+            and message.passes_receive_filter(connection._node_id)
+            and message.type_ == expected_type
+        ):
+            return message
+        raise RuntimeError("Remote party sent an invalid or unexpected response.")
+
+    connection_type._receive_message = _receive_message
+    connection_type._uepy_chunked_receive = True
+
+
 def _load_remote_module(path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location("_uepy_epic_remote_execution", path)
     if spec is None or spec.loader is None:
         raise UepyError(f"Could not load Epic remote execution helper: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _install_chunked_receive(module)
     return module
 
 
@@ -156,8 +236,7 @@ class UnrealRemoteClient:
             )
         except Exception as exc:
             raise ProtocolError(
-                "Remote execution failed. Large responses can exceed Epic's single-message "
-                f"client buffer; narrow the query if applicable. Details: {exc}"
+                f"Remote execution failed: {exc}"
             ) from exc
 
         if raise_on_failure and not response.get("success", False):
