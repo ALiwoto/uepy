@@ -1,6 +1,7 @@
 import unittest
 
 from uepy.client import _paths_overlap, _receive_complete_json_bytes
+from uepy import queries
 
 
 class FakeSocket:
@@ -43,6 +44,23 @@ class ChunkedReceiveTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "closed before"):
             _receive_complete_json_bytes(command_socket)
+
+
+class MaterialQueryTests(unittest.TestCase):
+    def test_material_query_escapes_path_and_sets_modes(self) -> None:
+        body = queries.material(
+            '/Game/Materials/MI_"Quoted"',
+            parameter_mode="overrides",
+            reference_limit=17,
+        )
+
+        self.assertIn('MI_\\"Quoted\\"', body)
+        self.assertIn('_uepy_parameter_mode = "overrides"', body)
+        self.assertIn("_uepy_reference_limit = 17", body)
+
+    def test_material_query_rejects_unknown_parameter_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            queries.material("/Game/Materials/M_Test", parameter_mode="everything")
 
 
 if __name__ == "__main__":

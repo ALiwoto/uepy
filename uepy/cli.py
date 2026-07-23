@@ -65,6 +65,23 @@ def _parser() -> argparse.ArgumentParser:
     mesh = commands.add_parser("mesh", help="inspect static-mesh bounds, LODs, and materials")
     mesh.add_argument("path", help="/Game path to a StaticMesh")
 
+    material = commands.add_parser(
+        "material", help="inspect a Material or Material Instance"
+    )
+    material.add_argument("path", help="/Game path to a Material or Material Instance")
+    material.add_argument(
+        "--parameters",
+        choices=("all", "overrides", "none"),
+        default="all",
+        help="parameter detail to include (default: all)",
+    )
+    material.add_argument(
+        "--reference-limit",
+        type=_positive_limit,
+        default=100,
+        help="maximum asset dependencies and referencers to return",
+    )
+
     evaluate = commands.add_parser("eval", help="run an arbitrary expression (not read-only enforced)")
     evaluate.add_argument("expression")
     evaluate.add_argument(
@@ -136,6 +153,12 @@ def main(argv: list[str] | None = None) -> int:
                 query_body = queries.asset(args.path)
             elif args.command == "mesh":
                 query_body = queries.mesh(args.path)
+            elif args.command == "material":
+                query_body = queries.material(
+                    args.path,
+                    parameter_mode=args.parameters,
+                    reference_limit=args.reference_limit,
+                )
 
             if query_body is not None:
                 _emit(client.query(query_body), args.compact)

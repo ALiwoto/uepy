@@ -24,5 +24,4 @@ dependencies = []
 uepy = "uepy.cli:main"
 
 [tool.setuptools]
-packages = ["uepy"]
-
+packages = ["uepy", "uepy.queries"]

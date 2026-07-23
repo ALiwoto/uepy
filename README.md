@@ -54,7 +54,16 @@ uepy actor PS_Clenfield_Initial
 uepy descriptors --match Clenfield
 uepy asset /Game/LevelPrototyping/Meshes/SM_Cube
 uepy mesh /Game/LevelPrototyping/Meshes/SM_Cube
+uepy material /Game/Materials/MI_Example
 ```
+
+`material` reports effective rendering properties, the complete parent chain,
+base-property overrides, scalar/vector/texture/static-switch parameters, used
+textures, loaded actor users, and Asset Registry dependencies/referencers. Use
+`--parameters overrides` for only parameters overridden on the inspected
+instance, or `--parameters none` for a compact structural report. It is a
+read-only inspection command; material edits still require explicit
+`exec --unsafe` usage.
 
 `descriptors` uses World Partition actor descriptors, so it can report actors
 that are not currently loaded. Result limits are capped at 100 to keep live
