@@ -103,6 +103,13 @@ An expression can call mutating functions, despite being called `eval`. Do not
 use raw execution against valuable editor state unless the command has been
 reviewed. Prefer the built-in inspection commands.
 
+`eval` expressions run in a lambda-local namespace. `exec` runs each script in
+a disposable function scope and performs Python garbage collection afterward.
+This prevents command-local actors, worlds, and packages from remaining rooted
+by Unreal's Python reference collector and causing a fatal world-leak check
+during a later map change. Definitions and variables created by one raw command
+therefore do not persist into the next command.
+
 ## Python API
 
 ```python

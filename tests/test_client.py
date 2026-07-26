@@ -1,6 +1,11 @@
 import unittest
 
-from uepy.client import _paths_overlap, _receive_complete_json_bytes
+from uepy.client import (
+    _paths_overlap,
+    _receive_complete_json_bytes,
+    _scoped_eval_expression,
+    _scoped_exec_script,
+)
 from uepy import queries
 
 
@@ -44,6 +49,33 @@ class ChunkedReceiveTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "closed before"):
             _receive_complete_json_bytes(command_socket)
+
+
+class ScopedExecutionTests(unittest.TestCase):
+    def test_wraps_eval_expression_in_lambda_scope(self) -> None:
+        wrapped = _scoped_eval_expression("(world := unreal.EditorLevelLibrary.get_editor_world())")
+
+        self.assertEqual(
+            wrapped,
+            "(lambda: ((world := unreal.EditorLevelLibrary.get_editor_world())))()",
+        )
+        compile(wrapped, "<uepy-test>", "eval")
+
+    def test_wraps_script_in_disposable_scope(self) -> None:
+        wrapped = _scoped_exec_script("world = unreal.EditorLevelLibrary.get_editor_world()", "_scope")
+
+        self.assertIn("def _scope():", wrapped)
+        self.assertIn("    world = unreal.EditorLevelLibrary.get_editor_world()", wrapped)
+        self.assertIn("finally:", wrapped)
+        self.assertIn("    del _scope", wrapped)
+        self.assertIn("_uepy_gc.collect()", wrapped)
+        compile(wrapped, "<uepy-test>", "exec")
+
+    def test_empty_script_is_valid(self) -> None:
+        wrapped = _scoped_exec_script("", "_scope")
+
+        self.assertIn("    pass", wrapped)
+        compile(wrapped, "<uepy-test>", "exec")
 
 
 class MaterialQueryTests(unittest.TestCase):

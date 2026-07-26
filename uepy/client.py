@@ -22,6 +22,36 @@ _MAX_RESPONSE_SIZE = 64 * 1024 * 1024
 _INCOMPLETE_RESPONSE_TIMEOUT_SECONDS = 5.0
 
 
+def _scoped_exec_script(script: str, scope_name: str) -> str:
+    """Wrap raw Unreal Python in a disposable function scope.
+
+    ExecuteFile commands run in Unreal's persistent Python module. Leaving a
+    UWorld, actor, or package in that module keeps it alive through
+    FPyReferenceCollector and makes the editor's next map change fatal. A
+    short-lived function releases ordinary locals as soon as the command
+    finishes. The explicit collection also handles local reference cycles.
+    """
+
+    body = script.rstrip() or "pass"
+    return (
+        f"def {scope_name}():\n"
+        f"{textwrap.indent(body, '    ')}\n"
+        "try:\n"
+        f"    {scope_name}()\n"
+        "finally:\n"
+        f"    del {scope_name}\n"
+        "    import gc as _uepy_gc\n"
+        "    _uepy_gc.collect()\n"
+        "    del _uepy_gc\n"
+    )
+
+
+def _scoped_eval_expression(expression: str) -> str:
+    """Evaluate an expression inside a lambda-local namespace."""
+
+    return f"(lambda: ({expression}))()"
+
+
 def _receive_complete_json_bytes(command_socket: Any) -> bytes:
     """Receive one complete JSON value from Epic's unframed TCP channel.
 
@@ -245,10 +275,17 @@ class UnrealRemoteClient:
         return response
 
     def evaluate(self, expression: str) -> dict[str, Any]:
-        return self.run(expression, mode=self.remote.MODE_EVAL_STATEMENT)
+        return self.run(
+            _scoped_eval_expression(expression),
+            mode=self.remote.MODE_EVAL_STATEMENT,
+        )
 
     def execute(self, script: str) -> dict[str, Any]:
-        return self.run(script, mode=self.remote.MODE_EXEC_FILE)
+        scope_name = f"_uepy_exec_scope_{uuid.uuid4().hex}"
+        return self.run(
+            _scoped_exec_script(script, scope_name),
+            mode=self.remote.MODE_EXEC_FILE,
+        )
 
     def query(self, body: str) -> Any:
         """Execute an inspection body and decode its ``_uepy_result`` value."""
