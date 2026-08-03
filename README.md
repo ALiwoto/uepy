@@ -54,6 +54,7 @@ uepy actors --match Village
 uepy actor BP_VillageGate
 uepy descriptors --match Village
 uepy asset /Game/LevelPrototyping/Meshes/SM_Cube
+uepy animation /Game/Characters/Hero/Animations/A_SpellPose
 uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph
 uepy mesh /Game/LevelPrototyping/Meshes/SM_Cube
 uepy material /Game/Materials/MI_Example
@@ -97,6 +98,39 @@ Then enable only the editor target:
 Other inspection commands do not require the plugin. If it is absent or its
 protocol version differs from the Python client, `uepy blueprint` returns a
 structured error instead of attempting incomplete graph inspection.
+
+### Animation Sequence edits
+
+`animation` reports the live Animation Sequence's sampled frame/key counts,
+transform-curve count, frame rate, duration, dirty state, and a deterministic
+bone-track and transform-curve fingerprint:
+
+```powershell
+uepy animation /Game/Characters/Hero/Animations/A_SpellPose
+```
+
+The reviewed `--promote-frame` operation removes every sampled frame before a
+chosen zero-based frame. This avoids timeline rounding errors in Unreal's menu
+commands for very short sequences. When the selected frame is the final key,
+the bridge retains a valid one-frame sequence containing two identical pose
+samples. Editor-authored skeletal adjustments stored as transform curves are
+promoted directly rather than passing through Unreal's short-sequence timeline
+resizing. First validate against the inspection fingerprint:
+
+```powershell
+uepy animation /Game/Characters/Hero/Animations/A_SpellPose --promote-frame 1 --expected-fingerprint COPY_FROM_INSPECTION
+```
+
+Then apply the same operation explicitly:
+
+```powershell
+uepy animation /Game/Characters/Hero/Animations/A_SpellPose --promote-frame 1 --expected-fingerprint COPY_FROM_INSPECTION --apply --unsafe
+```
+
+Application uses one editor Undo transaction and never saves the asset. Unlike
+Blueprint graph patches, it may intentionally operate on a dirty animation so
+an unsaved authored pose can be corrected; the fingerprint prevents editing a
+different live state than the one inspected.
 
 ### Blueprint graph patches
 

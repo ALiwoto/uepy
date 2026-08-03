@@ -62,6 +62,30 @@ def _parser() -> argparse.ArgumentParser:
     asset = commands.add_parser("asset", help="inspect a saved Unreal asset")
     asset.add_argument("path", help="/Game object or package path")
 
+    animation = commands.add_parser(
+        "animation", help="inspect or precisely edit an Animation Sequence"
+    )
+    animation.add_argument("path", help="/Game path to an Animation Sequence")
+    animation.add_argument(
+        "--promote-frame",
+        type=int,
+        help="remove all sampled frames before this zero-based frame index",
+    )
+    animation.add_argument(
+        "--expected-fingerprint",
+        help="fingerprint returned by an immediately preceding inspection",
+    )
+    animation.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply the reviewed operation transactionally without saving",
+    )
+    animation.add_argument(
+        "--unsafe",
+        action="store_true",
+        help="acknowledge that applying an animation edit mutates editor state",
+    )
+
     blueprint = commands.add_parser(
         "blueprint", help="inspect nodes, pins, and connections in a Blueprint graph"
     )
@@ -155,6 +179,13 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("blueprint --apply requires --patch")
         if args.apply and not args.unsafe:
             parser.error("blueprint --apply requires --unsafe")
+    if args.command == "animation":
+        if args.apply and args.promote_frame is None:
+            parser.error("animation --apply requires --promote-frame")
+        if args.promote_frame is not None and args.expected_fingerprint is None:
+            parser.error("animation --promote-frame requires --expected-fingerprint")
+        if args.apply and not args.unsafe:
+            parser.error("animation --apply requires --unsafe")
     try:
         with _client(args) as client:
             if args.command == "nodes":
@@ -177,6 +208,16 @@ def main(argv: list[str] | None = None) -> int:
                 query_body = queries.actor_descriptors(args.match, args.limit)
             elif args.command == "asset":
                 query_body = queries.asset(args.path)
+            elif args.command == "animation":
+                if args.promote_frame is None:
+                    query_body = queries.animation(args.path)
+                else:
+                    query_body = queries.promote_animation_frame(
+                        args.path,
+                        args.promote_frame,
+                        args.expected_fingerprint,
+                        apply=args.apply,
+                    )
             elif args.command == "blueprint":
                 if args.patch is None:
                     query_body = queries.blueprint(args.path, args.graph)
