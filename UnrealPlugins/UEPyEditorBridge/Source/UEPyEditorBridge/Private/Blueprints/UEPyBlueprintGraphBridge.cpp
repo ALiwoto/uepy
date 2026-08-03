@@ -8,6 +8,7 @@
 #include "AnimGraphNode_UseCachedPose.h"
 #include "Animation/AnimBlueprint.h"
 #include "Animation/Skeleton.h"
+#include "AnimationGraph.h"
 #include "AnimationStateMachineGraph.h"
 #include "Dom/JsonObject.h"
 #include "EdGraph/EdGraph.h"
@@ -25,9 +26,10 @@
 
 namespace
 {
-constexpr int32 BridgeProtocolVersion = 2;
+constexpr int32 BridgeProtocolVersion = 3;
 constexpr int32 BlueprintPatchFormatVersion = 1;
 constexpr int32 MaximumPatchOperations = 100;
+constexpr int32 MaximumBranchFiltersPerNode = 64;
 
 using FJsonObjectPtr = TSharedPtr<FJsonObject>;
 using FJsonValuePtr = TSharedPtr<FJsonValue>;
@@ -482,6 +484,10 @@ enum class EValidatedPatchOperationType : uint8
 	Connect,
 	Disconnect,
 	MoveNode,
+	AddSaveCachedPose,
+	AddUseCachedPose,
+	AddSlot,
+	AddLayeredBoneBlend,
 };
 
 struct FValidatedPatchOperation
@@ -494,6 +500,13 @@ struct FValidatedPatchOperation
 	int32 Y = 0;
 	int32 OriginalX = 0;
 	int32 OriginalY = 0;
+	FString Alias;
+	FString Name;
+	bool bAlwaysUpdateSourcePose = false;
+	bool bMeshSpaceRotationBlend = false;
+	bool bMeshSpaceScaleBlend = false;
+	float DefaultWeight = 1.0f;
+	TArray<FBranchFilter> BranchFilters;
 };
 
 FJsonObjectPtr MakePatchResult(
@@ -590,8 +603,134 @@ bool ResolveOperationPin(
 	return true;
 }
 
+FString NormalizedPatchName(const FString& Name)
+{
+	FString Result = Name;
+	Result.TrimStartAndEndInline();
+	Result.ToLowerInline();
+	return Result;
+}
+
+bool ReadCreationOperationBase(
+	const FJsonObject& OperationJson,
+	const int32 OperationIndex,
+	TSet<FString>& Aliases,
+	FValidatedPatchOperation& OutOperation,
+	FString& OutError)
+{
+	if (!OperationJson.TryGetStringField(TEXT("alias"), OutOperation.Alias))
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d requires an 'alias' string."),
+			OperationIndex);
+		return false;
+	}
+	OutOperation.Alias.TrimStartAndEndInline();
+	const FString NormalizedAlias = NormalizedPatchName(OutOperation.Alias);
+	if (NormalizedAlias.IsEmpty())
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d requires a non-empty 'alias'."),
+			OperationIndex);
+		return false;
+	}
+	if (Aliases.Contains(NormalizedAlias))
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d reuses alias '%s'."),
+			OperationIndex,
+			*OutOperation.Alias);
+		return false;
+	}
+	if (!OperationJson.TryGetNumberField(TEXT("x"), OutOperation.X)
+		|| !OperationJson.TryGetNumberField(TEXT("y"), OutOperation.Y))
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d requires integer 'x' and 'y' values."),
+			OperationIndex);
+		return false;
+	}
+	Aliases.Add(NormalizedAlias);
+	return true;
+}
+
+bool ReadRequiredCreationName(
+	const FJsonObject& OperationJson,
+	const TCHAR* FieldName,
+	const int32 OperationIndex,
+	FString& OutName,
+	FString& OutError)
+{
+	if (!OperationJson.TryGetStringField(FieldName, OutName))
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d requires a '%s' string."),
+			OperationIndex,
+			FieldName);
+		return false;
+	}
+	OutName.TrimStartAndEndInline();
+	if (OutName.IsEmpty())
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d requires a non-empty '%s'."),
+			OperationIndex,
+			FieldName);
+		return false;
+	}
+	return true;
+}
+
+bool IsCreationOperation(const EValidatedPatchOperationType Type)
+{
+	return Type == EValidatedPatchOperationType::AddSaveCachedPose
+		|| Type == EValidatedPatchOperationType::AddUseCachedPose
+		|| Type == EValidatedPatchOperationType::AddSlot
+		|| Type == EValidatedPatchOperationType::AddLayeredBoneBlend;
+}
+
+void FinalizeCreatedGraphNode(
+	UEdGraph* Graph,
+	UEdGraphNode* Node,
+	const int32 X,
+	const int32 Y)
+{
+	Node->CreateNewGuid();
+	Node->NodePosX = X;
+	Node->NodePosY = Y;
+	Node->SetFlags(RF_Transactional);
+	Node->AllocateDefaultPins();
+	Node->PostPlacedNewNode();
+	Graph->AddNode(Node, false, false);
+}
+
+void RollBackCreatedGraphNodes(
+	const TArray<TPair<FString, UEdGraphNode*>>& CreatedNodes,
+	UEdGraph* Graph,
+	UPackage* Package,
+	FScopedTransaction& Transaction)
+{
+	for (int32 NodeIndex = CreatedNodes.Num() - 1;
+		NodeIndex >= 0;
+		--NodeIndex)
+	{
+		UEdGraphNode* Node = CreatedNodes[NodeIndex].Value;
+		if (IsValid(Node))
+		{
+			Node->DestroyNode();
+		}
+	}
+	Transaction.Cancel();
+	Graph->NotifyGraphChanged();
+	if (Package != nullptr)
+	{
+		Package->SetDirtyFlag(false);
+	}
+}
+
 bool ValidatePatchOperations(
 	const FJsonObject& Patch,
+	UBlueprint* Blueprint,
 	UEdGraph* Graph,
 	TArray<FValidatedPatchOperation>& OutOperations,
 	FString& OutError)
@@ -621,6 +760,30 @@ bool ValidatePatchOperations(
 
 	TSet<FGuid> TouchedPins;
 	TSet<FGuid> MovedNodes;
+	TSet<FString> Aliases;
+	TSet<FString> AvailableCachedPoseNames;
+	TArray<UAnimGraphNode_SaveCachedPose*> ExistingCachedPoseNodes;
+	FBlueprintEditorUtils::GetAllNodesOfClass(
+		Blueprint,
+		ExistingCachedPoseNodes);
+	for (const UAnimGraphNode_SaveCachedPose* ExistingCachedPose
+		: ExistingCachedPoseNodes)
+	{
+		if (IsValid(ExistingCachedPose))
+		{
+			AvailableCachedPoseNames.Add(
+				NormalizedPatchName(ExistingCachedPose->CacheName));
+		}
+	}
+
+	UAnimBlueprint* AnimBlueprint = Cast<UAnimBlueprint>(Blueprint);
+	USkeleton* TargetSkeleton = AnimBlueprint != nullptr
+		? AnimBlueprint->TargetSkeleton
+		: nullptr;
+	const bool bIsAnimationGraph = Graph->IsA<UAnimationGraph>()
+		&& Graph->GetOuter() == AnimBlueprint;
+	bool bHasCreationOperation = false;
+	bool bHasExistingNodeOperation = false;
 	for (int32 OperationIndex = 0;
 		OperationIndex < OperationValues->Num();
 		++OperationIndex)
@@ -649,6 +812,7 @@ bool ValidatePatchOperations(
 		if (OperationName.Equals(TEXT("connect"), ESearchCase::IgnoreCase)
 			|| OperationName.Equals(TEXT("disconnect"), ESearchCase::IgnoreCase))
 		{
+			bHasExistingNodeOperation = true;
 			if (!ResolveOperationPin(
 				*OperationJson,
 				TEXT("from_node_id"),
@@ -725,6 +889,7 @@ bool ValidatePatchOperations(
 		}
 		else if (OperationName.Equals(TEXT("move_node"), ESearchCase::IgnoreCase))
 		{
+			bHasExistingNodeOperation = true;
 			FGuid NodeGuid;
 			if (!TryReadGuidField(*OperationJson, TEXT("node_id"), NodeGuid))
 			{
@@ -762,6 +927,270 @@ bool ValidatePatchOperations(
 			Operation.OriginalX = Operation.Node->NodePosX;
 			Operation.OriginalY = Operation.Node->NodePosY;
 		}
+		else if (OperationName.Equals(
+			TEXT("add_save_cached_pose"),
+			ESearchCase::IgnoreCase))
+		{
+			bHasCreationOperation = true;
+			if (!bIsAnimationGraph || AnimBlueprint == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d can only create nodes in an Animation Blueprint's AnimationGraph."),
+					OperationIndex);
+				return false;
+			}
+			if (!ReadCreationOperationBase(
+				*OperationJson,
+				OperationIndex,
+				Aliases,
+				Operation,
+				OutError)
+				|| !ReadRequiredCreationName(
+					*OperationJson,
+					TEXT("cache_name"),
+					OperationIndex,
+					Operation.Name,
+					OutError))
+			{
+				return false;
+			}
+
+			const FString NormalizedCacheName =
+				NormalizedPatchName(Operation.Name);
+			if (AvailableCachedPoseNames.Contains(NormalizedCacheName))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d reuses cached-pose name '%s'."),
+					OperationIndex,
+					*Operation.Name);
+				return false;
+			}
+			AvailableCachedPoseNames.Add(NormalizedCacheName);
+			Operation.Type = EValidatedPatchOperationType::AddSaveCachedPose;
+		}
+		else if (OperationName.Equals(
+			TEXT("add_use_cached_pose"),
+			ESearchCase::IgnoreCase))
+		{
+			bHasCreationOperation = true;
+			if (!bIsAnimationGraph || AnimBlueprint == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d can only create nodes in an Animation Blueprint's AnimationGraph."),
+					OperationIndex);
+				return false;
+			}
+			if (!ReadCreationOperationBase(
+				*OperationJson,
+				OperationIndex,
+				Aliases,
+				Operation,
+				OutError)
+				|| !ReadRequiredCreationName(
+					*OperationJson,
+					TEXT("cache_name"),
+					OperationIndex,
+					Operation.Name,
+					OutError))
+			{
+				return false;
+			}
+			if (!AvailableCachedPoseNames.Contains(
+				NormalizedPatchName(Operation.Name)))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d references unknown cached pose '%s'. Add its save node earlier in this patch or create it first."),
+					OperationIndex,
+					*Operation.Name);
+				return false;
+			}
+			Operation.Type = EValidatedPatchOperationType::AddUseCachedPose;
+		}
+		else if (OperationName.Equals(TEXT("add_slot"), ESearchCase::IgnoreCase))
+		{
+			bHasCreationOperation = true;
+			if (!bIsAnimationGraph || AnimBlueprint == nullptr
+				|| TargetSkeleton == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires an Animation Blueprint with a target skeleton and AnimationGraph."),
+					OperationIndex);
+				return false;
+			}
+			if (!ReadCreationOperationBase(
+				*OperationJson,
+				OperationIndex,
+				Aliases,
+				Operation,
+				OutError)
+				|| !ReadRequiredCreationName(
+					*OperationJson,
+					TEXT("slot_name"),
+					OperationIndex,
+					Operation.Name,
+					OutError))
+			{
+				return false;
+			}
+			if (!TargetSkeleton->ContainsSlotName(FName(*Operation.Name)))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d references slot '%s', which is not registered on the target skeleton."),
+					OperationIndex,
+					*Operation.Name);
+				return false;
+			}
+			if (OperationJson->HasField(TEXT("always_update_source_pose"))
+				&& !OperationJson->TryGetBoolField(
+					TEXT("always_update_source_pose"),
+					Operation.bAlwaysUpdateSourcePose))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d field 'always_update_source_pose' must be boolean."),
+					OperationIndex);
+				return false;
+			}
+			Operation.Type = EValidatedPatchOperationType::AddSlot;
+		}
+		else if (OperationName.Equals(
+			TEXT("add_layered_bone_blend"),
+			ESearchCase::IgnoreCase))
+		{
+			bHasCreationOperation = true;
+			if (!bIsAnimationGraph || AnimBlueprint == nullptr
+				|| TargetSkeleton == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires an Animation Blueprint with a target skeleton and AnimationGraph."),
+					OperationIndex);
+				return false;
+			}
+			if (!ReadCreationOperationBase(
+				*OperationJson,
+				OperationIndex,
+				Aliases,
+				Operation,
+				OutError))
+			{
+				return false;
+			}
+
+			double DefaultWeight = Operation.DefaultWeight;
+			if (OperationJson->HasField(TEXT("default_weight"))
+				&& (!OperationJson->TryGetNumberField(
+					TEXT("default_weight"),
+					DefaultWeight)
+					|| !FMath::IsFinite(DefaultWeight)
+					|| DefaultWeight < 0.0
+					|| DefaultWeight > 1.0))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d field 'default_weight' must be a finite number from 0 to 1."),
+					OperationIndex);
+				return false;
+			}
+			Operation.DefaultWeight = static_cast<float>(DefaultWeight);
+			if (OperationJson->HasField(TEXT("mesh_space_rotation_blend"))
+				&& !OperationJson->TryGetBoolField(
+					TEXT("mesh_space_rotation_blend"),
+					Operation.bMeshSpaceRotationBlend))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d field 'mesh_space_rotation_blend' must be boolean."),
+					OperationIndex);
+				return false;
+			}
+			if (OperationJson->HasField(TEXT("mesh_space_scale_blend"))
+				&& !OperationJson->TryGetBoolField(
+					TEXT("mesh_space_scale_blend"),
+					Operation.bMeshSpaceScaleBlend))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d field 'mesh_space_scale_blend' must be boolean."),
+					OperationIndex);
+				return false;
+			}
+
+			const TArray<FJsonValuePtr>* BranchFilterValues = nullptr;
+			if (!OperationJson->TryGetArrayField(
+				TEXT("branch_filters"),
+				BranchFilterValues)
+				|| BranchFilterValues == nullptr
+				|| BranchFilterValues->IsEmpty())
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires a non-empty 'branch_filters' array."),
+					OperationIndex);
+				return false;
+			}
+			if (BranchFilterValues->Num() > MaximumBranchFiltersPerNode)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d exceeds the %d-branch-filter safety limit."),
+					OperationIndex,
+					MaximumBranchFiltersPerNode);
+				return false;
+			}
+			TSet<FString> FilterBones;
+			for (int32 FilterIndex = 0;
+				FilterIndex < BranchFilterValues->Num();
+				++FilterIndex)
+			{
+				const FJsonValuePtr& FilterValue =
+					(*BranchFilterValues)[FilterIndex];
+				if (!FilterValue.IsValid() || FilterValue->Type != EJson::Object)
+				{
+					OutError = FString::Printf(
+						TEXT("Operation %d branch filter %d must be a JSON object."),
+						OperationIndex,
+						FilterIndex);
+					return false;
+				}
+				const FJsonObjectPtr FilterJson = FilterValue->AsObject();
+				FString BoneName;
+				int32 BlendDepth = 0;
+				if (!FilterJson.IsValid()
+					|| !ReadRequiredCreationName(
+						*FilterJson,
+						TEXT("bone"),
+						OperationIndex,
+						BoneName,
+						OutError)
+					|| !FilterJson->TryGetNumberField(
+						TEXT("blend_depth"),
+						BlendDepth))
+				{
+					OutError = FString::Printf(
+						TEXT("Operation %d branch filter %d requires string 'bone' and integer 'blend_depth'."),
+						OperationIndex,
+						FilterIndex);
+					return false;
+				}
+				const FString NormalizedBone = NormalizedPatchName(BoneName);
+				if (FilterBones.Contains(NormalizedBone))
+				{
+					OutError = FString::Printf(
+						TEXT("Operation %d repeats branch-filter bone '%s'."),
+						OperationIndex,
+						*BoneName);
+					return false;
+				}
+				if (TargetSkeleton->GetReferenceSkeleton().FindBoneIndex(
+					FName(*BoneName)) == INDEX_NONE)
+				{
+					OutError = FString::Printf(
+						TEXT("Operation %d branch-filter bone '%s' does not exist on the target skeleton."),
+						OperationIndex,
+						*BoneName);
+					return false;
+				}
+				FilterBones.Add(NormalizedBone);
+				FBranchFilter& BranchFilter = Operation.BranchFilters.AddDefaulted_GetRef();
+				BranchFilter.BoneName = FName(*BoneName);
+				BranchFilter.BlendDepth = BlendDepth;
+			}
+			Operation.Type = EValidatedPatchOperationType::AddLayeredBoneBlend;
+		}
 		else
 		{
 			OutError = FString::Printf(
@@ -772,6 +1201,11 @@ bool ValidatePatchOperations(
 		}
 
 		OutOperations.Add(Operation);
+	}
+	if (bHasCreationOperation && bHasExistingNodeOperation)
+	{
+		OutError = TEXT("Node-creation operations cannot be mixed with connect, disconnect, or move_node in one patch. Create, inspect, then connect in a separate patch.");
+		return false;
 	}
 	return true;
 }
@@ -836,7 +1270,7 @@ FString RunBlueprintGraphPatch(
 	}
 
 	TArray<FValidatedPatchOperation> Operations;
-	if (!ValidatePatchOperations(*Patch, Graph, Operations, Error))
+	if (!ValidatePatchOperations(*Patch, Blueprint, Graph, Operations, Error))
 	{
 		return FinishPatchError(Result, Error);
 	}
@@ -862,6 +1296,167 @@ FString RunBlueprintGraphPatch(
 		FText::FromString(TEXT("Apply uepy Blueprint graph patch")));
 	Blueprint->Modify();
 	Graph->Modify();
+
+	if (!Operations.IsEmpty() && IsCreationOperation(Operations[0].Type))
+	{
+		TArray<UAnimGraphNode_SaveCachedPose*> ExistingCachedPoseNodes;
+		FBlueprintEditorUtils::GetAllNodesOfClass(
+			Blueprint,
+			ExistingCachedPoseNodes);
+		TMap<FString, UAnimGraphNode_SaveCachedPose*> CachedPoseNodes;
+		for (UAnimGraphNode_SaveCachedPose* ExistingCachedPose
+			: ExistingCachedPoseNodes)
+		{
+			if (IsValid(ExistingCachedPose))
+			{
+				CachedPoseNodes.Add(
+					NormalizedPatchName(ExistingCachedPose->CacheName),
+					ExistingCachedPose);
+			}
+		}
+
+		TArray<TPair<FString, UEdGraphNode*>> CreatedNodes;
+		for (const FValidatedPatchOperation& Operation : Operations)
+		{
+			UEdGraphNode* CreatedNode = nullptr;
+			switch (Operation.Type)
+			{
+			case EValidatedPatchOperationType::AddSaveCachedPose:
+			{
+				UAnimGraphNode_SaveCachedPose* SaveCachedPose =
+					NewObject<UAnimGraphNode_SaveCachedPose>(Graph);
+				if (SaveCachedPose != nullptr)
+				{
+					SaveCachedPose->CacheName = Operation.Name;
+					FinalizeCreatedGraphNode(
+						Graph,
+						SaveCachedPose,
+						Operation.X,
+						Operation.Y);
+					CachedPoseNodes.Add(
+						NormalizedPatchName(Operation.Name),
+						SaveCachedPose);
+					CreatedNode = SaveCachedPose;
+				}
+				break;
+			}
+
+			case EValidatedPatchOperationType::AddUseCachedPose:
+			{
+				UAnimGraphNode_SaveCachedPose* const* SaveCachedPose =
+					CachedPoseNodes.Find(NormalizedPatchName(Operation.Name));
+				if (SaveCachedPose != nullptr && IsValid(*SaveCachedPose))
+				{
+					UAnimGraphNode_UseCachedPose* UseCachedPose =
+						NewObject<UAnimGraphNode_UseCachedPose>(Graph);
+					if (UseCachedPose != nullptr)
+					{
+						UseCachedPose->SaveCachedPoseNode = *SaveCachedPose;
+						FinalizeCreatedGraphNode(
+							Graph,
+							UseCachedPose,
+							Operation.X,
+							Operation.Y);
+						CreatedNode = UseCachedPose;
+					}
+				}
+				break;
+			}
+
+			case EValidatedPatchOperationType::AddSlot:
+			{
+				UAnimGraphNode_Slot* Slot = NewObject<UAnimGraphNode_Slot>(Graph);
+				if (Slot != nullptr)
+				{
+					Slot->Node.SlotName = FName(*Operation.Name);
+					Slot->Node.bAlwaysUpdateSourcePose =
+						Operation.bAlwaysUpdateSourcePose;
+					FinalizeCreatedGraphNode(
+						Graph,
+						Slot,
+						Operation.X,
+						Operation.Y);
+					CreatedNode = Slot;
+				}
+				break;
+			}
+
+			case EValidatedPatchOperationType::AddLayeredBoneBlend:
+			{
+				UAnimGraphNode_LayeredBoneBlend* LayeredBlend =
+					NewObject<UAnimGraphNode_LayeredBoneBlend>(Graph);
+				if (LayeredBlend != nullptr)
+				{
+					LayeredBlend->Node.BlendMode =
+						ELayeredBoneBlendMode::BranchFilter;
+					if (LayeredBlend->Node.LayerSetup.IsEmpty())
+					{
+						LayeredBlend->Node.AddPose();
+					}
+					LayeredBlend->Node.LayerSetup[0].BranchFilters =
+						Operation.BranchFilters;
+					LayeredBlend->Node.BlendWeights[0] = Operation.DefaultWeight;
+					LayeredBlend->Node.bMeshSpaceRotationBlend =
+						Operation.bMeshSpaceRotationBlend;
+					LayeredBlend->Node.bMeshSpaceScaleBlend =
+						Operation.bMeshSpaceScaleBlend;
+					FinalizeCreatedGraphNode(
+						Graph,
+						LayeredBlend,
+						Operation.X,
+						Operation.Y);
+					CreatedNode = LayeredBlend;
+				}
+				break;
+			}
+
+			case EValidatedPatchOperationType::Connect:
+			case EValidatedPatchOperationType::Disconnect:
+			case EValidatedPatchOperationType::MoveNode:
+				break;
+			}
+
+			if (CreatedNode == nullptr)
+			{
+				RollBackCreatedGraphNodes(
+					CreatedNodes,
+					Graph,
+					Package,
+					Transaction);
+				return FinishPatchError(
+					Result,
+					FString::Printf(
+						TEXT("Failed to create node for alias '%s'; all nodes created by this patch were rolled back."),
+						*Operation.Alias));
+			}
+			CreatedNodes.Emplace(Operation.Alias, CreatedNode);
+		}
+
+		Graph->NotifyGraphChanged();
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		const FString ResultingFingerprint =
+			BuildGraphFingerprint(Graph, AnimBlueprint);
+		TArray<FJsonValuePtr> CreatedNodeValues;
+		for (const TPair<FString, UEdGraphNode*>& CreatedNode : CreatedNodes)
+		{
+			FJsonObjectPtr CreatedNodeJson =
+				MakeNodeJson(CreatedNode.Value, AnimBlueprint);
+			CreatedNodeJson->SetStringField(TEXT("alias"), CreatedNode.Key);
+			CreatedNodeValues.Add(
+				MakeShared<FJsonValueObject>(CreatedNodeJson));
+		}
+		Result->SetArrayField(TEXT("created_nodes"), CreatedNodeValues);
+		Result->SetBoolField(TEXT("applied"), true);
+		Result->SetBoolField(TEXT("changed"), true);
+		Result->SetBoolField(
+			TEXT("package_dirty"),
+			Package != nullptr && Package->IsDirty());
+		Result->SetStringField(
+			TEXT("resulting_fingerprint"),
+			ResultingFingerprint);
+		return SerializeJson(Result);
+	}
+
 	int32 AppliedOperationCount = 0;
 	for (FValidatedPatchOperation& Operation : Operations)
 	{
@@ -894,6 +1489,11 @@ FString RunBlueprintGraphPatch(
 						AppliedOperation.Node->NodePosX = AppliedOperation.OriginalX;
 						AppliedOperation.Node->NodePosY = AppliedOperation.OriginalY;
 						break;
+					case EValidatedPatchOperationType::AddSaveCachedPose:
+					case EValidatedPatchOperationType::AddUseCachedPose:
+					case EValidatedPatchOperationType::AddSlot:
+					case EValidatedPatchOperationType::AddLayeredBoneBlend:
+						break;
 					}
 				}
 				Transaction.Cancel();
@@ -918,6 +1518,12 @@ FString RunBlueprintGraphPatch(
 			Operation.Node->Modify();
 			Operation.Node->NodePosX = Operation.X;
 			Operation.Node->NodePosY = Operation.Y;
+			break;
+
+		case EValidatedPatchOperationType::AddSaveCachedPose:
+		case EValidatedPatchOperationType::AddUseCachedPose:
+		case EValidatedPatchOperationType::AddSlot:
+		case EValidatedPatchOperationType::AddLayeredBoneBlend:
 			break;
 		}
 		++AppliedOperationCount;

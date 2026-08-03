@@ -102,8 +102,9 @@ structured error instead of attempting incomplete graph inspection.
 
 Inspection includes a graph `fingerprint`. A patch must include that exact
 fingerprint so a graph changed after inspection cannot be edited accidentally.
-The initial patch format supports connecting existing pins, disconnecting an
-existing link, and moving existing nodes:
+The patch format supports connecting existing pins, disconnecting an existing
+link, moving existing nodes, and creating a small reviewed set of Animation
+Blueprint nodes:
 
 ```json
 {
@@ -127,6 +128,65 @@ existing link, and moving existing nodes:
 }
 ```
 
+Node creation uses a separate patch so the new GUIDs and pins can be inspected
+before anything is connected. The supported creation operations are
+`add_save_cached_pose`, `add_use_cached_pose`, `add_slot`, and
+`add_layered_bone_blend`:
+
+```json
+{
+    "version": 1,
+    "expected_fingerprint": "COPY_FROM_INSPECTION",
+    "operations": [
+        {
+            "op": "add_save_cached_pose",
+            "alias": "spell_pose_save",
+            "cache_name": "SpellPose",
+            "x": -900,
+            "y": 300
+        },
+        {
+            "op": "add_use_cached_pose",
+            "alias": "spell_pose_use",
+            "cache_name": "SpellPose",
+            "x": -600,
+            "y": 300
+        },
+        {
+            "op": "add_slot",
+            "alias": "spell_slot",
+            "slot_name": "DefaultSlot",
+            "always_update_source_pose": false,
+            "x": -300,
+            "y": 300
+        },
+        {
+            "op": "add_layered_bone_blend",
+            "alias": "right_arm_blend",
+            "x": 0,
+            "y": 300,
+            "default_weight": 1.0,
+            "mesh_space_rotation_blend": false,
+            "mesh_space_scale_blend": false,
+            "branch_filters": [
+                {
+                    "bone": "clavicle_r",
+                    "blend_depth": 1
+                }
+            ]
+        }
+    ]
+}
+```
+
+Aliases must be unique within the patch. Cached-pose names must be unique in
+the Blueprint, and a use node may reference an existing save node or one added
+earlier in the same patch. Slot names must already be registered on the target
+skeleton; this operation deliberately does not edit the skeleton. Branch-filter
+bones must exist on that skeleton. A successful apply result includes
+`created_nodes` with each alias, node GUID, pins, position, and inspected node
+details.
+
 Validation is read-only and is the default:
 
 ```powershell
@@ -139,10 +199,12 @@ Applying requires two explicit acknowledgements:
 uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph --patch change.json --apply --unsafe
 ```
 
-Application is one editor Undo transaction and never compiles or saves the asset. It
-refuses dirty packages, stale fingerprints, unknown operations, reused pins,
+Application is one editor Undo transaction and never compiles or saves the asset.
+It refuses dirty packages, stale fingerprints, unknown operations, reused pins,
 implicit conversion nodes, and connections that would automatically break
-other links. A single patch is limited to 100 operations.
+other links. Creation operations cannot be mixed with connect, disconnect, or
+move operations: create, inspect, then connect with the resulting GUIDs in a
+second patch. A single patch is limited to 100 operations.
 
 `descriptors` uses World Partition actor descriptors, so it can report actors
 that are not currently loaded. Result limits are capped at 100 to keep live

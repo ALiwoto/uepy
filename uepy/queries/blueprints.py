@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-BRIDGE_PROTOCOL_VERSION = 2
+BRIDGE_PROTOCOL_VERSION = 3
 
 
 def blueprint(path: str, graph: str) -> str:
