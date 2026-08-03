@@ -10,6 +10,12 @@ The useful distinction from an Unreal commandlet is that `uepy` connects to the
 editor that is already open. Queries can therefore see loaded objects, current
 selection, and unsaved actor changes.
 
+Independent uepy processes targeting the same editor are serialized by an
+operating-system lock keyed to that editor's remote node ID. A later request
+waits until the active request finishes instead of opening a competing command
+connection. Requests to different editor instances remain independent, and the
+operating system releases the lock if a uepy process exits unexpectedly.
+
 ## Requirements
 
 - Python 3.10 or newer.

@@ -1,6 +1,9 @@
 import unittest
+from unittest.mock import patch
 
+import uepy.client as client_module
 from uepy.client import (
+    UnrealRemoteClient,
     _paths_overlap,
     _receive_complete_json_bytes,
     _scoped_eval_expression,
@@ -77,6 +80,71 @@ class ScopedExecutionTests(unittest.TestCase):
         self.assertIn("    pass", wrapped)
         compile(wrapped, "<uepy-test>", "exec")
 
+
+class CommandLockLifecycleTests(unittest.TestCase):
+    def _client(self, events: list[str], *, fail_open: bool = False) -> UnrealRemoteClient:
+        class FakeSession:
+            def open_command_connection(self, node_id: str) -> None:
+                events.append(f"open:{node_id}")
+                if fail_open:
+                    raise RuntimeError("busy")
+
+            def stop(self) -> None:
+                events.append("stop")
+
+        client = UnrealRemoteClient.__new__(UnrealRemoteClient)
+        client.session = FakeSession()
+        client.connected_node = None
+        client.command_lock = None
+        client.discover = lambda: [{"node_id": "NODE-1"}]
+        client.select_node = lambda nodes: list(nodes)[0]
+        return client
+
+    def test_holds_lock_from_before_connect_until_close(self) -> None:
+        events: list[str] = []
+
+        class FakeLock:
+            def __init__(self, node_id: str) -> None:
+                events.append(f"lock:{node_id}")
+
+            def acquire(self) -> None:
+                events.append("acquire")
+
+            def release(self) -> None:
+                events.append("release")
+
+        client = self._client(events)
+        with patch.object(client_module, "EditorCommandLock", FakeLock):
+            client.connect()
+            client.close()
+
+        self.assertEqual(
+            events,
+            ["lock:NODE-1", "acquire", "open:NODE-1", "stop", "release"],
+        )
+
+    def test_releases_lock_when_connection_fails(self) -> None:
+        events: list[str] = []
+
+        class FakeLock:
+            def __init__(self, node_id: str) -> None:
+                events.append(f"lock:{node_id}")
+
+            def acquire(self) -> None:
+                events.append("acquire")
+
+            def release(self) -> None:
+                events.append("release")
+
+        client = self._client(events, fail_open=True)
+        with patch.object(client_module, "EditorCommandLock", FakeLock):
+            with self.assertRaisesRegex(Exception, "Could not connect"):
+                client.connect()
+
+        self.assertEqual(
+            events,
+            ["lock:NODE-1", "acquire", "open:NODE-1", "release"],
+        )
 
 class MaterialQueryTests(unittest.TestCase):
     def test_material_query_escapes_path_and_sets_modes(self) -> None:

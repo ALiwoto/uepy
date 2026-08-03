@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 from .errors import DiscoveryError, ProtocolError, RemoteCommandError, UepyError
 from .locator import find_remote_execution
+from .locking import EditorCommandLock
 
 
 _RECEIVE_CHUNK_SIZE = 64 * 1024
@@ -168,6 +169,7 @@ class UnrealRemoteClient:
         self.cwd = str(Path(cwd or os.getcwd()).resolve())
         self.session: Any | None = None
         self.connected_node: dict[str, Any] | None = None
+        self.command_lock: EditorCommandLock | None = None
 
     def __enter__(self) -> "UnrealRemoteClient":
         self.start()
@@ -182,10 +184,16 @@ class UnrealRemoteClient:
             self.session.start()
 
     def close(self) -> None:
-        if self.session is not None:
-            self.session.stop()
+        try:
+            if self.session is not None:
+                self.session.stop()
+        finally:
             self.session = None
             self.connected_node = None
+            if self.command_lock is not None:
+                command_lock = self.command_lock
+                self.command_lock = None
+                command_lock.release()
 
     def discover(self) -> list[dict[str, Any]]:
         self.start()
@@ -248,10 +256,18 @@ class UnrealRemoteClient:
         if self.connected_node is not None:
             return self.connected_node
         node = self.select_node(self.discover())
+        node_id = str(node.get("node_id", ""))
+        if not node_id:
+            raise DiscoveryError("The selected Unreal Editor node has no node ID.")
+        command_lock = EditorCommandLock(node_id)
+        command_lock.acquire()
+        self.command_lock = command_lock
         try:
-            self.session.open_command_connection(node["node_id"])
+            self.session.open_command_connection(node_id)
         except Exception as exc:  # Epic's helper exposes RuntimeError only informally.
-            raise DiscoveryError(f"Could not connect to Unreal node {node['node_id']}: {exc}") from exc
+            self.command_lock = None
+            command_lock.release()
+            raise DiscoveryError(f"Could not connect to Unreal node {node_id}: {exc}") from exc
         self.connected_node = node
         return node
 
