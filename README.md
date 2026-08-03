@@ -187,6 +187,35 @@ bones must exist on that skeleton. A successful apply result includes
 `created_nodes` with each alias, node GUID, pins, position, and inspected node
 details.
 
+Adding one pose layer to an existing Branch Filter `Layered Blend per Bone`
+node is also a separate structural patch. It reconstructs that node and returns
+its updated pins under `updated_nodes`:
+
+```json
+{
+    "version": 1,
+    "expected_fingerprint": "COPY_FROM_INSPECTION",
+    "operations": [
+        {
+            "op": "add_layered_bone_blend_pose",
+            "alias": "right_hand_aim_pose",
+            "node_id": "LAYERED_BLEND_NODE_GUID",
+            "default_weight": 1.0,
+            "branch_filters": [
+                {
+                    "bone": "clavicle_r",
+                    "blend_depth": 1
+                }
+            ]
+        }
+    ]
+}
+```
+
+The target must use Branch Filter mode and have internally consistent pose,
+weight, and layer arrays. The operation does not connect the new pins; inspect
+the returned node and connect them with a later reviewed patch.
+
 Validation is read-only and is the default:
 
 ```powershell
@@ -202,9 +231,9 @@ uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph --pat
 Application is one editor Undo transaction and never compiles or saves the asset.
 It refuses dirty packages, stale fingerprints, unknown operations, reused pins,
 implicit conversion nodes, and connections that would automatically break
-other links. Creation operations cannot be mixed with connect, disconnect, or
-move operations: create, inspect, then connect with the resulting GUIDs in a
-second patch. A single patch is limited to 100 operations.
+other links. Node creation, layered-blend pose addition, and existing-pin edits
+cannot be mixed: perform one structural step, inspect its resulting pins, then
+connect them in a later patch. A single patch is limited to 100 operations.
 
 `descriptors` uses World Partition actor descriptors, so it can report actors
 that are not currently loaded. Result limits are capped at 100 to keep live

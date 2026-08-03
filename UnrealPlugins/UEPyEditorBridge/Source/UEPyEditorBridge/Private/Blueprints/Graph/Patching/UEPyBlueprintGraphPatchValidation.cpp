@@ -1,6 +1,7 @@
 #include "Blueprints/Graph/Patching/UEPyBlueprintGraphPatchValidation.h"
 
 #include "Blueprints/Graph/UEPyBlueprintGraphSerialization.h"
+#include "AnimGraphNode_LayeredBoneBlend.h"
 #include "AnimGraphNode_SaveCachedPose.h"
 #include "Animation/AnimBlueprint.h"
 #include "Animation/Skeleton.h"
@@ -101,7 +102,7 @@ FString NormalizedPatchName(const FString& Name)
 
 namespace
 {
-bool ReadCreationOperationBase(
+bool ReadOperationAlias(
 	const FJsonObject& OperationJson,
 	const int32 OperationIndex,
 	TSet<FString>& Aliases,
@@ -132,6 +133,26 @@ bool ReadCreationOperationBase(
 			*OutOperation.Alias);
 		return false;
 	}
+	Aliases.Add(NormalizedAlias);
+	return true;
+}
+
+bool ReadCreationOperationBase(
+	const FJsonObject& OperationJson,
+	const int32 OperationIndex,
+	TSet<FString>& Aliases,
+	FValidatedPatchOperation& OutOperation,
+	FString& OutError)
+{
+	if (!ReadOperationAlias(
+		OperationJson,
+		OperationIndex,
+		Aliases,
+		OutOperation,
+		OutError))
+	{
+		return false;
+	}
 	if (!OperationJson.TryGetNumberField(TEXT("x"), OutOperation.X)
 		|| !OperationJson.TryGetNumberField(TEXT("y"), OutOperation.Y))
 	{
@@ -140,7 +161,6 @@ bool ReadCreationOperationBase(
 			OperationIndex);
 		return false;
 	}
-	Aliases.Add(NormalizedAlias);
 	return true;
 }
 
@@ -167,6 +187,122 @@ bool ReadRequiredCreationName(
 			OperationIndex,
 			FieldName);
 		return false;
+	}
+	return true;
+}
+
+bool ReadLayerDefaultWeight(
+	const FJsonObject& OperationJson,
+	const int32 OperationIndex,
+	FValidatedPatchOperation& OutOperation,
+	FString& OutError)
+{
+	double DefaultWeight = OutOperation.DefaultWeight;
+	if (OperationJson.HasField(TEXT("default_weight"))
+		&& (!OperationJson.TryGetNumberField(
+			TEXT("default_weight"),
+			DefaultWeight)
+			|| !FMath::IsFinite(DefaultWeight)
+			|| DefaultWeight < 0.0
+			|| DefaultWeight > 1.0))
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d field 'default_weight' must be a finite number from 0 to 1."),
+			OperationIndex);
+		return false;
+	}
+	OutOperation.DefaultWeight = static_cast<float>(DefaultWeight);
+	return true;
+}
+
+bool ReadBranchFilters(
+	const FJsonObject& OperationJson,
+	const int32 OperationIndex,
+	const USkeleton& TargetSkeleton,
+	FValidatedPatchOperation& OutOperation,
+	FString& OutError)
+{
+	const TArray<FJsonValuePtr>* BranchFilterValues = nullptr;
+	if (!OperationJson.TryGetArrayField(
+		TEXT("branch_filters"),
+		BranchFilterValues)
+		|| BranchFilterValues == nullptr
+		|| BranchFilterValues->IsEmpty())
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d requires a non-empty 'branch_filters' array."),
+			OperationIndex);
+		return false;
+	}
+	if (BranchFilterValues->Num() > MaximumBranchFiltersPerNode)
+	{
+		OutError = FString::Printf(
+			TEXT("Operation %d exceeds the %d-branch-filter safety limit."),
+			OperationIndex,
+			MaximumBranchFiltersPerNode);
+		return false;
+	}
+
+	TSet<FString> FilterBones;
+	for (int32 FilterIndex = 0;
+		FilterIndex < BranchFilterValues->Num();
+		++FilterIndex)
+	{
+		const FJsonValuePtr& FilterValue = (*BranchFilterValues)[FilterIndex];
+		if (!FilterValue.IsValid() || FilterValue->Type != EJson::Object)
+		{
+			OutError = FString::Printf(
+				TEXT("Operation %d branch filter %d must be a JSON object."),
+				OperationIndex,
+				FilterIndex);
+			return false;
+		}
+
+		const FJsonObjectPtr FilterJson = FilterValue->AsObject();
+		FString BoneName;
+		int32 BlendDepth = 0;
+		if (!FilterJson.IsValid()
+			|| !ReadRequiredCreationName(
+				*FilterJson,
+				TEXT("bone"),
+				OperationIndex,
+				BoneName,
+				OutError)
+			|| !FilterJson->TryGetNumberField(
+				TEXT("blend_depth"),
+				BlendDepth))
+		{
+			OutError = FString::Printf(
+				TEXT("Operation %d branch filter %d requires string 'bone' and integer 'blend_depth'."),
+				OperationIndex,
+				FilterIndex);
+			return false;
+		}
+
+		const FString NormalizedBone = NormalizedPatchName(BoneName);
+		if (FilterBones.Contains(NormalizedBone))
+		{
+			OutError = FString::Printf(
+				TEXT("Operation %d repeats branch-filter bone '%s'."),
+				OperationIndex,
+				*BoneName);
+			return false;
+		}
+		if (TargetSkeleton.GetReferenceSkeleton().FindBoneIndex(
+			FName(*BoneName)) == INDEX_NONE)
+		{
+			OutError = FString::Printf(
+				TEXT("Operation %d branch-filter bone '%s' does not exist on the target skeleton."),
+				OperationIndex,
+				*BoneName);
+			return false;
+		}
+
+		FilterBones.Add(NormalizedBone);
+		FBranchFilter& BranchFilter =
+			OutOperation.BranchFilters.AddDefaulted_GetRef();
+		BranchFilter.BoneName = FName(*BoneName);
+		BranchFilter.BlendDepth = BlendDepth;
 	}
 	return true;
 }
@@ -212,6 +348,7 @@ bool ValidatePatchOperations(
 
 	TSet<FGuid> TouchedPins;
 	TSet<FGuid> MovedNodes;
+	TSet<FGuid> LayeredBlendNodesWithAddedPose;
 	TSet<FString> Aliases;
 	TSet<FString> AvailableCachedPoseNames;
 	TArray<UAnimGraphNode_SaveCachedPose*> ExistingCachedPoseNodes;
@@ -235,6 +372,7 @@ bool ValidatePatchOperations(
 	const bool bIsAnimationGraph = Graph->IsA<UAnimationGraph>()
 		&& Graph->GetOuter() == AnimBlueprint;
 	bool bHasCreationOperation = false;
+	bool bHasLayerPoseOperation = false;
 	bool bHasExistingNodeOperation = false;
 	for (int32 OperationIndex = 0;
 		OperationIndex < OperationValues->Num();
@@ -505,6 +643,93 @@ bool ValidatePatchOperations(
 			Operation.Type = EValidatedPatchOperationType::AddSlot;
 		}
 		else if (OperationName.Equals(
+			TEXT("add_layered_bone_blend_pose"),
+			ESearchCase::IgnoreCase))
+		{
+			bHasLayerPoseOperation = true;
+			if (!bIsAnimationGraph || AnimBlueprint == nullptr
+				|| TargetSkeleton == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires an Animation Blueprint with a target skeleton and AnimationGraph."),
+					OperationIndex);
+				return false;
+			}
+			if (!ReadOperationAlias(
+				*OperationJson,
+				OperationIndex,
+				Aliases,
+				Operation,
+				OutError))
+			{
+				return false;
+			}
+
+			FGuid NodeGuid;
+			if (!TryReadGuidField(*OperationJson, TEXT("node_id"), NodeGuid))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires a valid 'node_id' GUID."),
+					OperationIndex);
+				return false;
+			}
+			UAnimGraphNode_LayeredBoneBlend* LayeredBlend =
+				Cast<UAnimGraphNode_LayeredBoneBlend>(FindNodeByGuid(Graph, NodeGuid));
+			if (LayeredBlend == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d could not resolve layered-blend node '%s'."),
+					OperationIndex,
+					*NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+				return false;
+			}
+			if (LayeredBlendNodesWithAddedPose.Contains(NodeGuid))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d adds more than one pose to layered-blend node '%s'. Use separate reviewed patches."),
+					OperationIndex,
+					*NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+				return false;
+			}
+			if (LayeredBlend->Node.BlendMode
+				!= ELayeredBoneBlendMode::BranchFilter)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires a layered-blend node using BranchFilter mode."),
+					OperationIndex);
+				return false;
+			}
+			const int32 PoseCount = LayeredBlend->Node.BlendPoses.Num();
+			if (LayeredBlend->Node.LayerSetup.Num() != PoseCount
+				|| LayeredBlend->Node.BlendWeights.Num() != PoseCount)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d found inconsistent pose arrays on layered-blend node '%s'."),
+					OperationIndex,
+					*NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+				return false;
+			}
+			if (!ReadLayerDefaultWeight(
+				*OperationJson,
+				OperationIndex,
+				Operation,
+				OutError)
+				|| !ReadBranchFilters(
+					*OperationJson,
+					OperationIndex,
+					*TargetSkeleton,
+					Operation,
+					OutError))
+			{
+				return false;
+			}
+
+			LayeredBlendNodesWithAddedPose.Add(NodeGuid);
+			Operation.Node = LayeredBlend;
+			Operation.Type =
+				EValidatedPatchOperationType::AddLayeredBoneBlendPose;
+		}
+		else if (OperationName.Equals(
 			TEXT("add_layered_bone_blend"),
 			ESearchCase::IgnoreCase))
 		{
@@ -527,21 +752,14 @@ bool ValidatePatchOperations(
 				return false;
 			}
 
-			double DefaultWeight = Operation.DefaultWeight;
-			if (OperationJson->HasField(TEXT("default_weight"))
-				&& (!OperationJson->TryGetNumberField(
-					TEXT("default_weight"),
-					DefaultWeight)
-					|| !FMath::IsFinite(DefaultWeight)
-					|| DefaultWeight < 0.0
-					|| DefaultWeight > 1.0))
+			if (!ReadLayerDefaultWeight(
+				*OperationJson,
+				OperationIndex,
+				Operation,
+				OutError))
 			{
-				OutError = FString::Printf(
-					TEXT("Operation %d field 'default_weight' must be a finite number from 0 to 1."),
-					OperationIndex);
 				return false;
 			}
-			Operation.DefaultWeight = static_cast<float>(DefaultWeight);
 			if (OperationJson->HasField(TEXT("mesh_space_rotation_blend"))
 				&& !OperationJson->TryGetBoolField(
 					TEXT("mesh_space_rotation_blend"),
@@ -563,83 +781,14 @@ bool ValidatePatchOperations(
 				return false;
 			}
 
-			const TArray<FJsonValuePtr>* BranchFilterValues = nullptr;
-			if (!OperationJson->TryGetArrayField(
-				TEXT("branch_filters"),
-				BranchFilterValues)
-				|| BranchFilterValues == nullptr
-				|| BranchFilterValues->IsEmpty())
+			if (!ReadBranchFilters(
+				*OperationJson,
+				OperationIndex,
+				*TargetSkeleton,
+				Operation,
+				OutError))
 			{
-				OutError = FString::Printf(
-					TEXT("Operation %d requires a non-empty 'branch_filters' array."),
-					OperationIndex);
 				return false;
-			}
-			if (BranchFilterValues->Num() > MaximumBranchFiltersPerNode)
-			{
-				OutError = FString::Printf(
-					TEXT("Operation %d exceeds the %d-branch-filter safety limit."),
-					OperationIndex,
-					MaximumBranchFiltersPerNode);
-				return false;
-			}
-			TSet<FString> FilterBones;
-			for (int32 FilterIndex = 0;
-				FilterIndex < BranchFilterValues->Num();
-				++FilterIndex)
-			{
-				const FJsonValuePtr& FilterValue =
-					(*BranchFilterValues)[FilterIndex];
-				if (!FilterValue.IsValid() || FilterValue->Type != EJson::Object)
-				{
-					OutError = FString::Printf(
-						TEXT("Operation %d branch filter %d must be a JSON object."),
-						OperationIndex,
-						FilterIndex);
-					return false;
-				}
-				const FJsonObjectPtr FilterJson = FilterValue->AsObject();
-				FString BoneName;
-				int32 BlendDepth = 0;
-				if (!FilterJson.IsValid()
-					|| !ReadRequiredCreationName(
-						*FilterJson,
-						TEXT("bone"),
-						OperationIndex,
-						BoneName,
-						OutError)
-					|| !FilterJson->TryGetNumberField(
-						TEXT("blend_depth"),
-						BlendDepth))
-				{
-					OutError = FString::Printf(
-						TEXT("Operation %d branch filter %d requires string 'bone' and integer 'blend_depth'."),
-						OperationIndex,
-						FilterIndex);
-					return false;
-				}
-				const FString NormalizedBone = NormalizedPatchName(BoneName);
-				if (FilterBones.Contains(NormalizedBone))
-				{
-					OutError = FString::Printf(
-						TEXT("Operation %d repeats branch-filter bone '%s'."),
-						OperationIndex,
-						*BoneName);
-					return false;
-				}
-				if (TargetSkeleton->GetReferenceSkeleton().FindBoneIndex(
-					FName(*BoneName)) == INDEX_NONE)
-				{
-					OutError = FString::Printf(
-						TEXT("Operation %d branch-filter bone '%s' does not exist on the target skeleton."),
-						OperationIndex,
-						*BoneName);
-					return false;
-				}
-				FilterBones.Add(NormalizedBone);
-				FBranchFilter& BranchFilter = Operation.BranchFilters.AddDefaulted_GetRef();
-				BranchFilter.BoneName = FName(*BoneName);
-				BranchFilter.BlendDepth = BlendDepth;
 			}
 			Operation.Type = EValidatedPatchOperationType::AddLayeredBoneBlend;
 		}
@@ -654,9 +803,13 @@ bool ValidatePatchOperations(
 
 		OutOperations.Add(Operation);
 	}
-	if (bHasCreationOperation && bHasExistingNodeOperation)
+	const int32 OperationCategoryCount =
+		(bHasCreationOperation ? 1 : 0)
+		+ (bHasLayerPoseOperation ? 1 : 0)
+		+ (bHasExistingNodeOperation ? 1 : 0);
+	if (OperationCategoryCount > 1)
 	{
-		OutError = TEXT("Node-creation operations cannot be mixed with connect, disconnect, or move_node in one patch. Create, inspect, then connect in a separate patch.");
+		OutError = TEXT("Node creation, layered-blend pose addition, and existing-pin edits must use separate patches. Apply one structural step, inspect its new pins, then connect them.");
 		return false;
 	}
 	return true;

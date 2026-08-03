@@ -17,6 +17,7 @@ enum class EValidatedPatchOperationType : uint8
 	AddUseCachedPose,
 	AddSlot,
 	AddLayeredBoneBlend,
+	AddLayeredBoneBlendPose,
 };
 
 struct FValidatedPatchOperation

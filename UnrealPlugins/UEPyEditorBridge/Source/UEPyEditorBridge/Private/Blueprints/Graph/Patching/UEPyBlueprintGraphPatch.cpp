@@ -173,6 +173,49 @@ FString RunBlueprintGraphPatch(
 	Blueprint->Modify();
 	Graph->Modify();
 
+	if (!Operations.IsEmpty()
+		&& Operations[0].Type
+			== EValidatedPatchOperationType::AddLayeredBoneBlendPose)
+	{
+		TArray<FJsonValuePtr> UpdatedNodeValues;
+		for (const FValidatedPatchOperation& Operation : Operations)
+		{
+			UAnimGraphNode_LayeredBoneBlend* LayeredBlend =
+				CastChecked<UAnimGraphNode_LayeredBoneBlend>(Operation.Node);
+			LayeredBlend->Modify();
+			const int32 NewPoseIndex = LayeredBlend->Node.BlendPoses.Num();
+			LayeredBlend->Node.AddPose();
+			LayeredBlend->Node.LayerSetup[NewPoseIndex].BranchFilters =
+				Operation.BranchFilters;
+			LayeredBlend->Node.BlendWeights[NewPoseIndex] =
+				Operation.DefaultWeight;
+			LayeredBlend->Node.InvalidatePerBoneBlendWeights();
+			LayeredBlend->ReconstructNode();
+
+			FJsonObjectPtr UpdatedNodeJson =
+				MakeNodeJson(LayeredBlend, AnimBlueprint);
+			UpdatedNodeJson->SetStringField(TEXT("alias"), Operation.Alias);
+			UpdatedNodeJson->SetNumberField(
+				TEXT("added_pose_index"),
+				NewPoseIndex);
+			UpdatedNodeValues.Add(
+				MakeShared<FJsonValueObject>(UpdatedNodeJson));
+		}
+
+		Graph->NotifyGraphChanged();
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		Result->SetArrayField(TEXT("updated_nodes"), UpdatedNodeValues);
+		Result->SetBoolField(TEXT("applied"), true);
+		Result->SetBoolField(TEXT("changed"), true);
+		Result->SetBoolField(
+			TEXT("package_dirty"),
+			Package != nullptr && Package->IsDirty());
+		Result->SetStringField(
+			TEXT("resulting_fingerprint"),
+			BuildGraphFingerprint(Graph, AnimBlueprint));
+		return SerializeJson(Result);
+	}
+
 	if (!Operations.IsEmpty() && IsCreationOperation(Operations[0].Type))
 	{
 		TArray<UAnimGraphNode_SaveCachedPose*> ExistingCachedPoseNodes;
@@ -289,6 +332,7 @@ FString RunBlueprintGraphPatch(
 			case EValidatedPatchOperationType::Connect:
 			case EValidatedPatchOperationType::Disconnect:
 			case EValidatedPatchOperationType::MoveNode:
+			case EValidatedPatchOperationType::AddLayeredBoneBlendPose:
 				break;
 			}
 
@@ -369,6 +413,7 @@ FString RunBlueprintGraphPatch(
 					case EValidatedPatchOperationType::AddUseCachedPose:
 					case EValidatedPatchOperationType::AddSlot:
 					case EValidatedPatchOperationType::AddLayeredBoneBlend:
+					case EValidatedPatchOperationType::AddLayeredBoneBlendPose:
 						break;
 					}
 				}
@@ -400,6 +445,7 @@ FString RunBlueprintGraphPatch(
 		case EValidatedPatchOperationType::AddUseCachedPose:
 		case EValidatedPatchOperationType::AddSlot:
 		case EValidatedPatchOperationType::AddLayeredBoneBlend:
+		case EValidatedPatchOperationType::AddLayeredBoneBlendPose:
 			break;
 		}
 		++AppliedOperationCount;
