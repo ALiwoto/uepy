@@ -67,6 +67,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     blueprint.add_argument("path", help="/Game path to a Blueprint asset")
     blueprint.add_argument("--graph", required=True, help="graph name, such as AnimGraph")
+    blueprint.add_argument(
+        "--patch",
+        type=Path,
+        help="validate a versioned JSON patch against the graph",
+    )
+    blueprint.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply --patch transactionally without saving the asset",
+    )
+    blueprint.add_argument(
+        "--unsafe",
+        action="store_true",
+        help="acknowledge that applying a graph patch mutates editor state",
+    )
 
     mesh = commands.add_parser("mesh", help="inspect static-mesh bounds, LODs, and materials")
     mesh.add_argument("path", help="/Game path to a StaticMesh")
@@ -135,6 +150,11 @@ def _raw_response(response: dict[str, Any]) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "blueprint":
+        if args.apply and args.patch is None:
+            parser.error("blueprint --apply requires --patch")
+        if args.apply and not args.unsafe:
+            parser.error("blueprint --apply requires --unsafe")
     try:
         with _client(args) as client:
             if args.command == "nodes":
@@ -158,7 +178,15 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "asset":
                 query_body = queries.asset(args.path)
             elif args.command == "blueprint":
-                query_body = queries.blueprint(args.path, args.graph)
+                if args.patch is None:
+                    query_body = queries.blueprint(args.path, args.graph)
+                else:
+                    query_body = queries.blueprint_patch(
+                        args.path,
+                        args.graph,
+                        args.patch.read_text(encoding="utf-8"),
+                        apply=args.apply,
+                    )
             elif args.command == "mesh":
                 query_body = queries.mesh(args.path)
             elif args.command == "material":

@@ -1,7 +1,8 @@
 # uepy
 
 `uepy` is a dependency-free Python module and CLI for inspecting a running
-Unreal Editor through Epic's **Python Editor Script Plugin**. It uses the
+Unreal Editor and applying explicitly reviewed editor patches through Epic's
+**Python Editor Script Plugin**. It uses the
 `remote_execution.py` client shipped with the installed Unreal Engine, so the
 protocol stays aligned with the local engine rather than being reimplemented.
 
@@ -96,6 +97,52 @@ Then enable only the editor target:
 Other inspection commands do not require the plugin. If it is absent or its
 protocol version differs from the Python client, `uepy blueprint` returns a
 structured error instead of attempting incomplete graph inspection.
+
+### Blueprint graph patches
+
+Inspection includes a graph `fingerprint`. A patch must include that exact
+fingerprint so a graph changed after inspection cannot be edited accidentally.
+The initial patch format supports connecting existing pins, disconnecting an
+existing link, and moving existing nodes:
+
+```json
+{
+    "version": 1,
+    "expected_fingerprint": "COPY_FROM_INSPECTION",
+    "operations": [
+        {
+            "op": "move_node",
+            "node_id": "NODE_GUID",
+            "x": -640,
+            "y": 160
+        },
+        {
+            "op": "connect",
+            "from_node_id": "OUTPUT_NODE_GUID",
+            "from_pin_id": "OUTPUT_PIN_GUID",
+            "to_node_id": "INPUT_NODE_GUID",
+            "to_pin_id": "INPUT_PIN_GUID"
+        }
+    ]
+}
+```
+
+Validation is read-only and is the default:
+
+```powershell
+uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph --patch change.json
+```
+
+Applying requires two explicit acknowledgements:
+
+```powershell
+uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph --patch change.json --apply --unsafe
+```
+
+Application is one editor Undo transaction and never compiles or saves the asset. It
+refuses dirty packages, stale fingerprints, unknown operations, reused pins,
+implicit conversion nodes, and connections that would automatically break
+other links. A single patch is limited to 100 operations.
 
 `descriptors` uses World Partition actor descriptors, so it can report actors
 that are not currently loaded. Result limits are capped at 100 to keep live

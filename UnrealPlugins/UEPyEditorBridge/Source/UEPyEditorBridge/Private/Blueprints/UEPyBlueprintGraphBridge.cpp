@@ -15,12 +15,19 @@
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraph/EdGraphSchema.h"
 #include "Engine/Blueprint.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Misc/SecureHash.h"
+#include "ScopedTransaction.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonReader.h"
 #include "Serialization/JsonWriter.h"
+#include "UObject/Package.h"
 
 namespace
 {
-constexpr int32 BridgeProtocolVersion = 1;
+constexpr int32 BridgeProtocolVersion = 2;
+constexpr int32 BlueprintPatchFormatVersion = 1;
+constexpr int32 MaximumPatchOperations = 100;
 
 using FJsonObjectPtr = TSharedPtr<FJsonObject>;
 using FJsonValuePtr = TSharedPtr<FJsonValue>;
@@ -405,6 +412,529 @@ FJsonObjectPtr MakeConnectionJson(const FGraphConnection& Connection)
 			*Connection.ToPin->PinName.ToString()));
 	return Result;
 }
+
+TArray<UEdGraphNode*> GetSortedGraphNodes(UEdGraph* Graph)
+{
+	TArray<UEdGraphNode*> Nodes;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (IsValid(Node))
+		{
+			Nodes.Add(Node);
+		}
+	}
+	Nodes.Sort([](const UEdGraphNode& Left, const UEdGraphNode& Right)
+	{
+		return Left.NodeGuid.ToString() < Right.NodeGuid.ToString();
+	});
+	return Nodes;
+}
+
+FString BuildGraphFingerprint(
+	UEdGraph* Graph,
+	const UAnimBlueprint* AnimBlueprint)
+{
+	FString CanonicalGraph;
+	for (UEdGraphNode* Node : GetSortedGraphNodes(Graph))
+	{
+		CanonicalGraph += SerializeJson(MakeNodeJson(Node, AnimBlueprint));
+		CanonicalGraph += TEXT("\n");
+	}
+
+	const FTCHARToUTF8 EncodedGraph(*CanonicalGraph);
+	return LexToString(FSHA1::HashBuffer(
+		EncodedGraph.Get(),
+		EncodedGraph.Length()));
+}
+
+bool ResolveBlueprintGraph(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	UBlueprint*& OutBlueprint,
+	UEdGraph*& OutGraph,
+	FString& OutError)
+{
+	OutBlueprint = Cast<UBlueprint>(LoadObject<UObject>(nullptr, *BlueprintPath));
+	if (OutBlueprint == nullptr)
+	{
+		OutError = TEXT("Asset was not found or is not a Blueprint.");
+		return false;
+	}
+
+	TArray<UEdGraph*> Graphs;
+	OutBlueprint->GetAllGraphs(Graphs);
+	for (UEdGraph* Graph : Graphs)
+	{
+		if (IsValid(Graph)
+			&& Graph->GetName().Equals(GraphName, ESearchCase::IgnoreCase))
+		{
+			OutGraph = Graph;
+			return true;
+		}
+	}
+
+	OutError = TEXT("Requested graph was not found.");
+	return false;
+}
+
+enum class EValidatedPatchOperationType : uint8
+{
+	Connect,
+	Disconnect,
+	MoveNode,
+};
+
+struct FValidatedPatchOperation
+{
+	EValidatedPatchOperationType Type = EValidatedPatchOperationType::MoveNode;
+	UEdGraphNode* Node = nullptr;
+	UEdGraphPin* FromPin = nullptr;
+	UEdGraphPin* ToPin = nullptr;
+	int32 X = 0;
+	int32 Y = 0;
+	int32 OriginalX = 0;
+	int32 OriginalY = 0;
+};
+
+FJsonObjectPtr MakePatchResult(
+	const FString& BlueprintPath,
+	const FString& GraphName)
+{
+	FJsonObjectPtr Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("bridge_protocol_version"), BridgeProtocolVersion);
+	Result->SetNumberField(TEXT("patch_format_version"), BlueprintPatchFormatVersion);
+	Result->SetStringField(TEXT("requested_path"), BlueprintPath);
+	Result->SetStringField(TEXT("requested_graph"), GraphName);
+	Result->SetBoolField(TEXT("valid"), false);
+	Result->SetBoolField(TEXT("applied"), false);
+	Result->SetBoolField(TEXT("changed"), false);
+	return Result;
+}
+
+FString FinishPatchError(
+	const FJsonObjectPtr& Result,
+	const FString& Error)
+{
+	Result->SetStringField(TEXT("error"), Error);
+	return SerializeJson(Result);
+}
+
+bool TryReadGuidField(
+	const FJsonObject& Object,
+	const TCHAR* FieldName,
+	FGuid& OutGuid)
+{
+	FString GuidText;
+	return Object.TryGetStringField(FieldName, GuidText)
+		&& FGuid::Parse(GuidText, OutGuid);
+}
+
+UEdGraphNode* FindNodeByGuid(UEdGraph* Graph, const FGuid& NodeGuid)
+{
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (IsValid(Node) && Node->NodeGuid == NodeGuid)
+		{
+			return Node;
+		}
+	}
+	return nullptr;
+}
+
+UEdGraphPin* FindPinByGuid(UEdGraphNode* Node, const FGuid& PinGuid)
+{
+	if (Node == nullptr)
+	{
+		return nullptr;
+	}
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (Pin != nullptr && Pin->PinId == PinGuid)
+		{
+			return Pin;
+		}
+	}
+	return nullptr;
+}
+
+bool ResolveOperationPin(
+	const FJsonObject& OperationJson,
+	const TCHAR* NodeField,
+	const TCHAR* PinField,
+	UEdGraph* Graph,
+	UEdGraphPin*& OutPin,
+	FString& OutError)
+{
+	FGuid NodeGuid;
+	FGuid PinGuid;
+	if (!TryReadGuidField(OperationJson, NodeField, NodeGuid)
+		|| !TryReadGuidField(OperationJson, PinField, PinGuid))
+	{
+		OutError = FString::Printf(
+			TEXT("Operation requires valid '%s' and '%s' GUIDs."),
+			NodeField,
+			PinField);
+		return false;
+	}
+
+	UEdGraphNode* Node = FindNodeByGuid(Graph, NodeGuid);
+	OutPin = FindPinByGuid(Node, PinGuid);
+	if (OutPin == nullptr)
+	{
+		OutError = FString::Printf(
+			TEXT("Could not resolve pin '%s' on node '%s'."),
+			*PinGuid.ToString(EGuidFormats::DigitsWithHyphens),
+			*NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		return false;
+	}
+	return true;
+}
+
+bool ValidatePatchOperations(
+	const FJsonObject& Patch,
+	UEdGraph* Graph,
+	TArray<FValidatedPatchOperation>& OutOperations,
+	FString& OutError)
+{
+	const TArray<FJsonValuePtr>* OperationValues = nullptr;
+	if (!Patch.TryGetArrayField(TEXT("operations"), OperationValues)
+		|| OperationValues == nullptr
+		|| OperationValues->IsEmpty())
+	{
+		OutError = TEXT("Patch requires a non-empty 'operations' array.");
+		return false;
+	}
+	if (OperationValues->Num() > MaximumPatchOperations)
+	{
+		OutError = FString::Printf(
+			TEXT("Patch exceeds the %d-operation safety limit."),
+			MaximumPatchOperations);
+		return false;
+	}
+
+	const UEdGraphSchema* Schema = Graph->GetSchema();
+	if (Schema == nullptr)
+	{
+		OutError = TEXT("Graph has no schema.");
+		return false;
+	}
+
+	TSet<FGuid> TouchedPins;
+	TSet<FGuid> MovedNodes;
+	for (int32 OperationIndex = 0;
+		OperationIndex < OperationValues->Num();
+		++OperationIndex)
+	{
+		const FJsonValuePtr& OperationValue = (*OperationValues)[OperationIndex];
+		if (!OperationValue.IsValid() || OperationValue->Type != EJson::Object)
+		{
+			OutError = FString::Printf(
+				TEXT("Operation %d must be a JSON object."),
+				OperationIndex);
+			return false;
+		}
+
+		const FJsonObjectPtr OperationJson = OperationValue->AsObject();
+		FString OperationName;
+		if (!OperationJson.IsValid()
+			|| !OperationJson->TryGetStringField(TEXT("op"), OperationName))
+		{
+			OutError = FString::Printf(
+				TEXT("Operation %d requires an 'op' string."),
+				OperationIndex);
+			return false;
+		}
+
+		FValidatedPatchOperation Operation;
+		if (OperationName.Equals(TEXT("connect"), ESearchCase::IgnoreCase)
+			|| OperationName.Equals(TEXT("disconnect"), ESearchCase::IgnoreCase))
+		{
+			if (!ResolveOperationPin(
+				*OperationJson,
+				TEXT("from_node_id"),
+				TEXT("from_pin_id"),
+				Graph,
+				Operation.FromPin,
+				OutError)
+				|| !ResolveOperationPin(
+					*OperationJson,
+					TEXT("to_node_id"),
+					TEXT("to_pin_id"),
+					Graph,
+					Operation.ToPin,
+					OutError))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d: %s"),
+					OperationIndex,
+					*OutError);
+				return false;
+			}
+
+			if (Operation.FromPin->Direction != EGPD_Output
+				|| Operation.ToPin->Direction != EGPD_Input)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d must identify an output pin followed by an input pin."),
+					OperationIndex);
+				return false;
+			}
+			if (TouchedPins.Contains(Operation.FromPin->PinId)
+				|| TouchedPins.Contains(Operation.ToPin->PinId))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d reuses a pin already touched by this patch."),
+					OperationIndex);
+				return false;
+			}
+			TouchedPins.Add(Operation.FromPin->PinId);
+			TouchedPins.Add(Operation.ToPin->PinId);
+
+			if (OperationName.Equals(TEXT("connect"), ESearchCase::IgnoreCase))
+			{
+				if (Operation.FromPin->LinkedTo.Contains(Operation.ToPin))
+				{
+					OutError = FString::Printf(
+						TEXT("Operation %d requests a connection that already exists."),
+						OperationIndex);
+					return false;
+				}
+				const FPinConnectionResponse Response =
+					Schema->CanCreateConnection(Operation.FromPin, Operation.ToPin);
+				if (Response.Response != CONNECT_RESPONSE_MAKE)
+				{
+					OutError = FString::Printf(
+						TEXT("Operation %d cannot create a side-effect-free connection: %s"),
+						OperationIndex,
+						*Response.Message.ToString());
+					return false;
+				}
+				Operation.Type = EValidatedPatchOperationType::Connect;
+			}
+			else
+			{
+				if (!Operation.FromPin->LinkedTo.Contains(Operation.ToPin))
+				{
+					OutError = FString::Printf(
+						TEXT("Operation %d requests a connection that does not exist."),
+						OperationIndex);
+					return false;
+				}
+				Operation.Type = EValidatedPatchOperationType::Disconnect;
+			}
+		}
+		else if (OperationName.Equals(TEXT("move_node"), ESearchCase::IgnoreCase))
+		{
+			FGuid NodeGuid;
+			if (!TryReadGuidField(*OperationJson, TEXT("node_id"), NodeGuid))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires a valid 'node_id' GUID."),
+					OperationIndex);
+				return false;
+			}
+			Operation.Node = FindNodeByGuid(Graph, NodeGuid);
+			if (Operation.Node == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d could not resolve node '%s'."),
+					OperationIndex,
+					*NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+				return false;
+			}
+			if (MovedNodes.Contains(NodeGuid))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d moves a node already moved by this patch."),
+					OperationIndex);
+				return false;
+			}
+			if (!OperationJson->TryGetNumberField(TEXT("x"), Operation.X)
+				|| !OperationJson->TryGetNumberField(TEXT("y"), Operation.Y))
+			{
+				OutError = FString::Printf(
+					TEXT("Operation %d requires integer 'x' and 'y' values."),
+					OperationIndex);
+				return false;
+			}
+			MovedNodes.Add(NodeGuid);
+			Operation.Type = EValidatedPatchOperationType::MoveNode;
+			Operation.OriginalX = Operation.Node->NodePosX;
+			Operation.OriginalY = Operation.Node->NodePosY;
+		}
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("Operation %d uses unsupported op '%s'."),
+				OperationIndex,
+				*OperationName);
+			return false;
+		}
+
+		OutOperations.Add(Operation);
+	}
+	return true;
+}
+
+FString RunBlueprintGraphPatch(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& PatchJson,
+	const bool bApply)
+{
+	FJsonObjectPtr Result = MakePatchResult(BlueprintPath, GraphName);
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	FString Error;
+	if (!ResolveBlueprintGraph(
+		BlueprintPath,
+		GraphName,
+		Blueprint,
+		Graph,
+		Error))
+	{
+		return FinishPatchError(Result, Error);
+	}
+
+	const UAnimBlueprint* AnimBlueprint = Cast<UAnimBlueprint>(Blueprint);
+	const FString CurrentFingerprint = BuildGraphFingerprint(Graph, AnimBlueprint);
+	Result->SetStringField(TEXT("current_fingerprint"), CurrentFingerprint);
+	Result->SetBoolField(
+		TEXT("package_dirty"),
+		Blueprint->GetOutermost() != nullptr
+			&& Blueprint->GetOutermost()->IsDirty());
+
+	FJsonObjectPtr Patch;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PatchJson);
+	if (!FJsonSerializer::Deserialize(Reader, Patch) || !Patch.IsValid())
+	{
+		return FinishPatchError(Result, TEXT("Patch is not valid JSON."));
+	}
+
+	int32 PatchVersion = 0;
+	if (!Patch->TryGetNumberField(TEXT("version"), PatchVersion)
+		|| PatchVersion != BlueprintPatchFormatVersion)
+	{
+		return FinishPatchError(
+			Result,
+			FString::Printf(
+				TEXT("Patch 'version' must be %d."),
+				BlueprintPatchFormatVersion));
+	}
+
+	FString ExpectedFingerprint;
+	if (!Patch->TryGetStringField(
+		TEXT("expected_fingerprint"),
+		ExpectedFingerprint)
+		|| !ExpectedFingerprint.Equals(
+			CurrentFingerprint,
+			ESearchCase::IgnoreCase))
+	{
+		return FinishPatchError(
+			Result,
+			TEXT("Patch fingerprint does not match the current graph. Inspect it again before patching."));
+	}
+
+	TArray<FValidatedPatchOperation> Operations;
+	if (!ValidatePatchOperations(*Patch, Graph, Operations, Error))
+	{
+		return FinishPatchError(Result, Error);
+	}
+	Result->SetNumberField(TEXT("operation_count"), Operations.Num());
+	Result->SetBoolField(TEXT("valid"), true);
+	if (!bApply)
+	{
+		Result->SetStringField(TEXT("resulting_fingerprint"), CurrentFingerprint);
+		return SerializeJson(Result);
+	}
+
+	UPackage* Package = Blueprint->GetOutermost();
+	if (Package != nullptr && Package->IsDirty())
+	{
+		Result->SetBoolField(TEXT("valid"), false);
+		return FinishPatchError(
+			Result,
+			TEXT("Refusing to patch a dirty Blueprint package. Save or revert it first."));
+	}
+
+	const UEdGraphSchema* Schema = Graph->GetSchema();
+	FScopedTransaction Transaction(
+		FText::FromString(TEXT("Apply uepy Blueprint graph patch")));
+	Blueprint->Modify();
+	Graph->Modify();
+	int32 AppliedOperationCount = 0;
+	for (FValidatedPatchOperation& Operation : Operations)
+	{
+		switch (Operation.Type)
+		{
+		case EValidatedPatchOperationType::Connect:
+			Operation.FromPin->GetOwningNode()->Modify();
+			Operation.ToPin->GetOwningNode()->Modify();
+			if (!Schema->TryCreateConnection(Operation.FromPin, Operation.ToPin))
+			{
+				for (int32 RollbackIndex = AppliedOperationCount - 1;
+					RollbackIndex >= 0;
+					--RollbackIndex)
+				{
+					const FValidatedPatchOperation& AppliedOperation =
+						Operations[RollbackIndex];
+					switch (AppliedOperation.Type)
+					{
+					case EValidatedPatchOperationType::Connect:
+						Schema->BreakSinglePinLink(
+							AppliedOperation.FromPin,
+							AppliedOperation.ToPin);
+						break;
+					case EValidatedPatchOperationType::Disconnect:
+						Schema->TryCreateConnection(
+							AppliedOperation.FromPin,
+							AppliedOperation.ToPin);
+						break;
+					case EValidatedPatchOperationType::MoveNode:
+						AppliedOperation.Node->NodePosX = AppliedOperation.OriginalX;
+						AppliedOperation.Node->NodePosY = AppliedOperation.OriginalY;
+						break;
+					}
+				}
+				Transaction.Cancel();
+				Graph->NotifyGraphChanged();
+				if (Package != nullptr)
+				{
+					Package->SetDirtyFlag(false);
+				}
+				return FinishPatchError(
+					Result,
+					TEXT("A prevalidated connection unexpectedly failed; earlier operations were rolled back."));
+			}
+			break;
+
+		case EValidatedPatchOperationType::Disconnect:
+			Operation.FromPin->GetOwningNode()->Modify();
+			Operation.ToPin->GetOwningNode()->Modify();
+			Schema->BreakSinglePinLink(Operation.FromPin, Operation.ToPin);
+			break;
+
+		case EValidatedPatchOperationType::MoveNode:
+			Operation.Node->Modify();
+			Operation.Node->NodePosX = Operation.X;
+			Operation.Node->NodePosY = Operation.Y;
+			break;
+		}
+		++AppliedOperationCount;
+	}
+
+	Graph->NotifyGraphChanged();
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	const FString ResultingFingerprint =
+		BuildGraphFingerprint(Graph, AnimBlueprint);
+	Result->SetBoolField(TEXT("applied"), true);
+	Result->SetBoolField(TEXT("changed"), true);
+	Result->SetBoolField(
+		TEXT("package_dirty"),
+		Package != nullptr && Package->IsDirty());
+	Result->SetStringField(TEXT("resulting_fingerprint"), ResultingFingerprint);
+	return SerializeJson(Result);
+}
 }
 
 FString UUEPyBlueprintGraphBridge::InspectBlueprintGraphJson(
@@ -512,6 +1042,9 @@ FString UUEPyBlueprintGraphBridge::InspectBlueprintGraphJson(
 	});
 
 	const UAnimBlueprint* AnimBlueprint = Cast<UAnimBlueprint>(Blueprint);
+	GraphJson->SetStringField(
+		TEXT("fingerprint"),
+		BuildGraphFingerprint(RequestedGraph, AnimBlueprint));
 	TArray<FJsonValuePtr> NodeValues;
 	for (UEdGraphNode* Node : Nodes)
 	{
@@ -555,6 +1088,30 @@ FString UUEPyBlueprintGraphBridge::InspectBlueprintGraphJson(
 	GraphJson->SetArrayField(TEXT("connections"), ConnectionValues);
 	Result->SetObjectField(TEXT("graph"), GraphJson);
 	return SerializeJson(Result);
+}
+
+FString UUEPyBlueprintGraphBridge::ValidateBlueprintGraphPatchJson(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& PatchJson)
+{
+	return RunBlueprintGraphPatch(
+		BlueprintPath,
+		GraphName,
+		PatchJson,
+		false);
+}
+
+FString UUEPyBlueprintGraphBridge::ApplyBlueprintGraphPatchJson(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& PatchJson)
+{
+	return RunBlueprintGraphPatch(
+		BlueprintPath,
+		GraphName,
+		PatchJson,
+		true);
 }
 
 int32 UUEPyBlueprintGraphBridge::GetBridgeProtocolVersion()
