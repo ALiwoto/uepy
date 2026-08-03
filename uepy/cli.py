@@ -62,6 +62,12 @@ def _parser() -> argparse.ArgumentParser:
     asset = commands.add_parser("asset", help="inspect a saved Unreal asset")
     asset.add_argument("path", help="/Game object or package path")
 
+    blueprint = commands.add_parser(
+        "blueprint", help="inspect nodes, pins, and connections in a Blueprint graph"
+    )
+    blueprint.add_argument("path", help="/Game path to a Blueprint asset")
+    blueprint.add_argument("--graph", required=True, help="graph name, such as AnimGraph")
+
     mesh = commands.add_parser("mesh", help="inspect static-mesh bounds, LODs, and materials")
     mesh.add_argument("path", help="/Game path to a StaticMesh")
 
@@ -151,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
                 query_body = queries.actor_descriptors(args.match, args.limit)
             elif args.command == "asset":
                 query_body = queries.asset(args.path)
+            elif args.command == "blueprint":
+                query_body = queries.blueprint(args.path, args.graph)
             elif args.command == "mesh":
                 query_body = queries.mesh(args.path)
             elif args.command == "material":

@@ -49,10 +49,11 @@ uepy nodes
 uepy status
 uepy world
 uepy selected --limit 10
-uepy actors --match Clenfield
-uepy actor PS_Clenfield_Initial
-uepy descriptors --match Clenfield
+uepy actors --match Village
+uepy actor BP_VillageGate
+uepy descriptors --match Village
 uepy asset /Game/LevelPrototyping/Meshes/SM_Cube
+uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph
 uepy mesh /Game/LevelPrototyping/Meshes/SM_Cube
 uepy material /Game/Materials/MI_Example
 ```
@@ -65,6 +66,37 @@ instance, or `--parameters none` for a compact structural report. It is a
 read-only inspection command; material edits still require explicit
 `exec --unsafe` usage.
 
+`blueprint` uses the optional `UEPyEditorBridge` plugin to report a
+graph's nodes, stable node and pin IDs, positions, pin types/defaults, every
+connection, and concise connection flow. Animation Blueprints also report
+useful authored details for sequence players, slots, layered bone blends,
+cached poses, and state machines. The command only loads and reads the asset;
+it never compiles, dirties, changes, or saves it.
+
+The bridge is distributed with this repository under
+`UnrealPlugins/UEPyEditorBridge`. Add its parent directory to the consuming
+project's `.uproject`, adjusting the relative path for that checkout:
+
+```json
+"AdditionalPluginDirectories": [
+    "../Tools/uepy/UnrealPlugins"
+]
+```
+
+Then enable only the editor target:
+
+```json
+{
+    "Name": "UEPyEditorBridge",
+    "Enabled": true,
+    "TargetAllowList": ["Editor"]
+}
+```
+
+Other inspection commands do not require the plugin. If it is absent or its
+protocol version differs from the Python client, `uepy blueprint` returns a
+structured error instead of attempting incomplete graph inspection.
+
 `descriptors` uses World Partition actor descriptors, so it can report actors
 that are not currently loaded. Result limits are capped at 100 to keep live
 main-thread inspection bounded. `uepy` patches UE 5.4's bundled TCP receiver at
@@ -75,13 +107,13 @@ Every inspection command emits JSON. Add `--compact` before the command for
 machine-oriented single-line output:
 
 ```powershell
-uepy --compact actor PS_Clenfield_Initial
+uepy --compact actor BP_VillageGate
 ```
 
 If several editors are open, select one explicitly:
 
 ```powershell
-uepy --project Peacebound world
+uepy --project MyGame world
 uepy --node CC9F5DF0 world
 ```
 
@@ -116,7 +148,7 @@ therefore do not persist into the next command.
 from uepy import UnrealRemoteClient
 from uepy import queries
 
-with UnrealRemoteClient(project="Peacebound") as client:
+with UnrealRemoteClient(project="MyGame") as client:
     node = client.connect()
     current_world = client.query(queries.world())
 ```

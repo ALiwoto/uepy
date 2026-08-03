@@ -209,6 +209,11 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Unreal plugin build output
+UnrealPlugins/**/Binaries/
+UnrealPlugins/**/Intermediate/
+UnrealPlugins/**/Saved/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
