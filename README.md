@@ -60,7 +60,8 @@ uepy actors --match Village
 uepy actor BP_VillageGate
 uepy descriptors --match Village
 uepy asset /Game/LevelPrototyping/Meshes/SM_Cube
-uepy duplicate /Game/VFX/N_Source /Game/Peacebound/VFX/N_Derived
+uepy duplicate /Game/VFX/N_Source /Game/Derived/VFX/N_Derived
+uepy shadow-proxy /Game/World/SM_Wall
 uepy animation /Game/Characters/Hero/Animations/A_SpellPose
 uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph
 uepy mesh /Game/LevelPrototyping/Meshes/SM_Cube
@@ -71,12 +72,29 @@ uepy material /Game/Materials/MI_Example
 refuses to replace an existing destination unless `--force` is supplied:
 
 ```powershell
-uepy duplicate /Game/VFX/N_Source /Game/Peacebound/VFX/N_Derived --force
+uepy duplicate /Game/VFX/N_Source /Game/Derived/VFX/N_Derived --force
 ```
 
 When forced, the existing destination asset is deleted before the replacement
 is duplicated and saved. The source and destination must therefore be reviewed
 carefully before using `--force`.
+
+`shadow-proxy` uses uepy's own generic `UEPyEditorBridge` plugin to create
+`SM_Name_Shadow` beside a source StaticMesh. The default retains 1% of the
+source triangles, writes the reduced geometry as the destination's only baked
+source LOD0, removes unnecessary collision and rendering data, and saves the
+package. It requires bridge version 0.3.0 or newer. An explicit destination is
+also supported:
+
+```powershell
+uepy shadow-proxy /Game/World/Architecture/SM_Wall
+uepy shadow-proxy /Game/World/SM_Wall --destination /Game/Generated/SM_WallProxy
+uepy shadow-proxy /Game/World/Architecture/SM_Wall --percent 2.5 --force
+```
+
+An existing proxy is never changed unless `--force` is supplied. Forced
+rebuilding updates the StaticMesh object in place so actors holding hard
+references continue to reference the rebuilt proxy.
 
 `material` reports effective rendering properties, the complete parent chain,
 base-property overrides, scalar/vector/texture/static-switch parameters, used
@@ -353,8 +371,10 @@ appropriate.
 - Python exposes Unreal-reflected APIs. Some non-reflected C++ internals may
   require a small editor-only C++ bridge.
 - Inspection commands can load a requested asset into editor memory but never
-  set properties, save packages, import content, or delete data. `duplicate` is
-  an explicit exception: it creates and saves its destination, and `--force`
-  deletes an existing destination first.
+  set properties, save packages, import content, or delete data. `duplicate`
+  and `shadow-proxy` are explicit exceptions. Both create and save destination
+  assets and require `--force` before replacing one; `duplicate` deletes its
+  destination first, while `shadow-proxy` rebuilds a StaticMesh in place so
+  existing hard references remain valid.
 - Live queries run on the editor's main thread. Keep them small and do not issue
   concurrent commands while the editor is busy.

@@ -137,5 +137,84 @@ class DuplicateAssetCliTests(unittest.TestCase):
         self.assertIn("already exists", stderr.getvalue())
 
 
+class ShadowProxyQueryTests(unittest.TestCase):
+    def test_builds_success_report(self) -> None:
+        success = object()
+
+        class AssetTools:
+            @staticmethod
+            def bake_shadow_proxy(
+                source: str,
+                destination: str,
+                fraction: float,
+                force: bool,
+            ):
+                self.assertEqual(source, "/Game/Test/SM_Wall")
+                self.assertEqual(destination, "")
+                self.assertEqual(fraction, 0.01)
+                self.assertTrue(force)
+                return (
+                    success,
+                    "/Game/Test/SM_Wall_Shadow.SM_Wall_Shadow",
+                    10_000,
+                    100,
+                    4_096,
+                    "",
+                )
+
+        unreal = SimpleNamespace(
+            UEPyStaticMeshAssetBridge=AssetTools,
+            UEPyShadowProxyBakeResult=SimpleNamespace(SUCCESS=success),
+        )
+        scope = {"unreal": unreal}
+        exec(
+            queries.bake_shadow_proxy(
+                "/Game/Test/SM_Wall",
+                destination_path=None,
+                triangle_fraction=0.01,
+                force=True,
+            ),
+            scope,
+        )
+
+        result = scope["_uepy_result"]
+        self.assertTrue(result["baked"])
+        self.assertEqual(result["proxy_triangles"], 100)
+        self.assertEqual(result["saved_package_bytes"], 4_096)
+
+    def test_reports_missing_bridge(self) -> None:
+        scope = {"unreal": SimpleNamespace()}
+        exec(queries.bake_shadow_proxy("/Game/Test/SM_Wall"), scope)
+
+        result = scope["_uepy_result"]
+        self.assertFalse(result["baked"])
+        self.assertIn("0.3.0", result["error"])
+
+
+class ShadowProxyCliTests(unittest.TestCase):
+    def test_failed_bake_returns_nonzero(self) -> None:
+        class FakeClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                return None
+
+            def query(self, body: str) -> dict:
+                self.body = body
+                return {
+                    "baked": False,
+                    "error": "Destination already exists; pass --force.",
+                }
+
+        stderr = io.StringIO()
+        with patch("uepy.cli._client", return_value=FakeClient()):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = main(["shadow-proxy", "/Game/Test/SM_Wall"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("--force", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

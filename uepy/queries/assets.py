@@ -98,3 +98,58 @@ else:
             "saved": True,
         }}
 """
+
+
+def bake_shadow_proxy(
+    source_path: str,
+    destination_path: str | None = None,
+    triangle_fraction: float = 0.01,
+    force: bool = False,
+) -> str:
+    source_literal = json.dumps(source_path)
+    destination_literal = json.dumps(destination_path or "")
+    fraction_literal = repr(triangle_fraction)
+    force_literal = "True" if force else "False"
+    return f"""
+_uepy_source_path = {source_literal}
+_uepy_requested_destination_path = {destination_literal}
+_uepy_triangle_fraction = {fraction_literal}
+_uepy_force = {force_literal}
+_uepy_result = {{
+    "baked": False,
+    "source": _uepy_source_path,
+    "requested_destination": _uepy_requested_destination_path or None,
+    "triangle_fraction": _uepy_triangle_fraction,
+    "forced": _uepy_force,
+}}
+_uepy_bridge = getattr(unreal, "UEPyStaticMeshAssetBridge", None)
+_uepy_result_enum = getattr(unreal, "UEPyShadowProxyBakeResult", None)
+if _uepy_bridge is None or _uepy_result_enum is None:
+    _uepy_result["error"] = (
+        "UEPyEditorBridge 0.3.0 or newer is required for shadow-proxy baking."
+    )
+else:
+    (
+        _uepy_bake_result,
+        _uepy_destination_path,
+        _uepy_source_triangles,
+        _uepy_proxy_triangles,
+        _uepy_saved_package_bytes,
+        _uepy_error,
+    ) = _uepy_bridge.bake_shadow_proxy(
+        _uepy_source_path,
+        _uepy_requested_destination_path,
+        _uepy_triangle_fraction,
+        _uepy_force,
+    )
+    _uepy_result.update({{
+        "baked": _uepy_bake_result == _uepy_result_enum.SUCCESS,
+        "result": str(_uepy_bake_result),
+        "destination": _uepy_destination_path,
+        "source_triangles": _uepy_source_triangles,
+        "proxy_triangles": _uepy_proxy_triangles,
+        "saved_package_bytes": _uepy_saved_package_bytes,
+    }})
+    if _uepy_error:
+        _uepy_result["error"] = _uepy_error
+"""

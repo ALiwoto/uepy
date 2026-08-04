@@ -25,6 +25,15 @@ def _positive_limit(value: str) -> int:
     return parsed
 
 
+def _shadow_proxy_percent(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.01 or parsed >= 100.0:
+        raise argparse.ArgumentTypeError(
+            "percent must be at least 0.01 and less than 100"
+        )
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="uepy",
@@ -78,6 +87,27 @@ def _parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="replace the destination asset if it already exists",
+    )
+
+    shadow_proxy = commands.add_parser(
+        "shadow-proxy",
+        help="bake and save a simplified sibling StaticMesh for shadows",
+    )
+    shadow_proxy.add_argument("source", help="source /Game StaticMesh path")
+    shadow_proxy.add_argument(
+        "--destination",
+        help="destination path (default: sibling SourceName_Shadow)",
+    )
+    shadow_proxy.add_argument(
+        "--percent",
+        type=_shadow_proxy_percent,
+        default=1.0,
+        help="triangle percentage to retain (default: 1.0)",
+    )
+    shadow_proxy.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild an existing SM_Name_Shadow asset in place",
     )
 
     animation = commands.add_parser(
@@ -240,6 +270,13 @@ def main(argv: list[str] | None = None) -> int:
                     args.destination,
                     force=args.force,
                 )
+            elif args.command == "shadow-proxy":
+                query_body = queries.bake_shadow_proxy(
+                    args.source,
+                    destination_path=args.destination,
+                    triangle_fraction=args.percent / 100.0,
+                    force=args.force,
+                )
             elif args.command == "animation":
                 if args.promote_frame is None:
                     query_body = queries.animation(args.path)
@@ -273,6 +310,12 @@ def main(argv: list[str] | None = None) -> int:
                 result = client.query(query_body)
                 if args.command == "duplicate" and not result.get("duplicated", False):
                     error = result.get("error", "Unreal could not duplicate the asset.")
+                    print(f"uepy: error: {error}", file=sys.stderr)
+                    return 1
+                if args.command == "shadow-proxy" and not result.get("baked", False):
+                    error = result.get(
+                        "error", "Unreal could not bake the shadow proxy."
+                    )
                     print(f"uepy: error: {error}", file=sys.stderr)
                     return 1
                 _emit(result, args.compact)

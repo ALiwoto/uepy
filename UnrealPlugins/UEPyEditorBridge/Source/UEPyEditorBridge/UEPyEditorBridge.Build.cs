@@ -17,7 +17,12 @@ public class UEPyEditorBridge : ModuleRules
 		{
 			"AnimGraph",
 			"AnimGraphRuntime",
+			"AssetRegistry",
 			"Json",
+			"MeshDescription",
+			"MeshReductionInterface",
+			"MeshUtilitiesCommon",
+			"StaticMeshDescription",
 			"UnrealEd"
 		});
 	}
