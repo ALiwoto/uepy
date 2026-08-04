@@ -14,6 +14,7 @@
 #include "MeshDescription.h"
 #include "Misc/PackageName.h"
 #include "Modules/ModuleManager.h"
+#include "ObjectTools.h"
 #include "OverlappingCorners.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "StaticMeshAttributes.h"
@@ -22,9 +23,12 @@
 #include "StaticMeshResources.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "UObject/Package.h"
+#include "UObject/MetaData.h"
 #include "UObject/SavePackage.h"
 #include "UObject/SoftObjectPath.h"
+#include "UObject/UObjectHash.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UObjectIterator.h"
 
 namespace
 {
@@ -77,10 +81,109 @@ EUEPyShadowProxyBakeResult Fail(
 	return Result;
 }
 
-void CollapseToOneMaterialSection(FMeshDescription& MeshDescription)
+TSet<FName> CaptureDirtyPackageNames()
+{
+	TSet<FName> DirtyPackageNames;
+	for (TObjectIterator<UPackage> PackageIt; PackageIt; ++PackageIt)
+	{
+		if (PackageIt->IsDirty())
+		{
+			DirtyPackageNames.Add(PackageIt->GetFName());
+		}
+	}
+	return DirtyPackageNames;
+}
+
+void RestorePreviouslyCleanPackages(
+	const TSet<FName>& DirtyPackageNamesBeforeReplacement)
+{
+	for (TObjectIterator<UPackage> PackageIt; PackageIt; ++PackageIt)
+	{
+		if (PackageIt->IsDirty()
+			&& !DirtyPackageNamesBeforeReplacement.Contains(
+				PackageIt->GetFName()))
+		{
+			PackageIt->SetDirtyFlag(false);
+		}
+	}
+}
+
+using FObjectMetadataSnapshot =
+	TMap<TWeakObjectPtr<UObject>, TMap<FName, FString>>;
+
+FObjectMetadataSnapshot CaptureObjectMetadata(UObject& RootObject)
+{
+	TArray<UObject*> Objects = {&RootObject};
+	GetObjectsWithOuter(&RootObject, Objects, true);
+
+	FObjectMetadataSnapshot Snapshot;
+	for (UObject* Object : Objects)
+	{
+		if (const TMap<FName, FString>* Values =
+			UMetaData::GetMapForObject(Object))
+		{
+			Snapshot.Add(Object, *Values);
+		}
+	}
+	return Snapshot;
+}
+
+void RestoreObjectMetadata(
+	UMetaData& Metadata,
+	const FObjectMetadataSnapshot& Snapshot)
+{
+	for (const TPair<TWeakObjectPtr<UObject>, TMap<FName, FString>>& Pair
+		: Snapshot)
+	{
+		if (UObject* Object = Pair.Key.Get())
+		{
+			Metadata.SetObjectValues(Object, Pair.Value);
+		}
+	}
+}
+
+bool ExpandProxyBoundsToContainSource(
+	UStaticMesh& ProxyMesh,
+	const UStaticMesh& SourceMesh)
+{
+	const FBox ProxyBounds = ProxyMesh.GetBoundingBox();
+	const FBox SourceBounds = SourceMesh.GetBoundingBox();
+	if (!ProxyBounds.IsValid || !SourceBounds.IsValid)
+	{
+		return false;
+	}
+
+	const FVector PositiveExtension(
+		FMath::Max(0.0, SourceBounds.Max.X - ProxyBounds.Max.X),
+		FMath::Max(0.0, SourceBounds.Max.Y - ProxyBounds.Max.Y),
+		FMath::Max(0.0, SourceBounds.Max.Z - ProxyBounds.Max.Z));
+	const FVector NegativeExtension(
+		FMath::Max(0.0, ProxyBounds.Min.X - SourceBounds.Min.X),
+		FMath::Max(0.0, ProxyBounds.Min.Y - SourceBounds.Min.Y),
+		FMath::Max(0.0, ProxyBounds.Min.Z - SourceBounds.Min.Z));
+	ProxyMesh.SetPositiveBoundsExtension(PositiveExtension);
+	ProxyMesh.SetNegativeBoundsExtension(NegativeExtension);
+	ProxyMesh.CalculateExtendedBounds();
+
+	const FBox ExpandedProxyBounds = ProxyMesh.GetBoundingBox();
+	constexpr double BoundsTolerance = 0.01;
+	return ExpandedProxyBounds.Min.X <= SourceBounds.Min.X + BoundsTolerance
+		&& ExpandedProxyBounds.Min.Y <= SourceBounds.Min.Y + BoundsTolerance
+		&& ExpandedProxyBounds.Min.Z <= SourceBounds.Min.Z + BoundsTolerance
+		&& ExpandedProxyBounds.Max.X >= SourceBounds.Max.X - BoundsTolerance
+		&& ExpandedProxyBounds.Max.Y >= SourceBounds.Max.Y - BoundsTolerance
+		&& ExpandedProxyBounds.Max.Z >= SourceBounds.Max.Z - BoundsTolerance;
+}
+
+FPolygonGroupID CollapsePolygonGroupsToOne(FMeshDescription& MeshDescription)
 {
 	const FPolygonGroupID FirstPolygonGroup =
 		MeshDescription.PolygonGroups().GetFirstValidID();
+	if (FirstPolygonGroup == INDEX_NONE)
+	{
+		return INDEX_NONE;
+	}
+
 	TMap<FPolygonGroupID, FPolygonGroupID> PolygonGroupRemap;
 	for (const FPolygonGroupID PolygonGroupId
 		: MeshDescription.PolygonGroups().GetElementIDs())
@@ -88,6 +191,14 @@ void CollapseToOneMaterialSection(FMeshDescription& MeshDescription)
 		PolygonGroupRemap.Add(PolygonGroupId, FirstPolygonGroup);
 	}
 	MeshDescription.RemapPolygonGroups(PolygonGroupRemap);
+	return FirstPolygonGroup;
+}
+
+void CollapseToOneMaterialSection(FMeshDescription& MeshDescription)
+{
+	const FPolygonGroupID FirstPolygonGroup =
+		CollapsePolygonGroupsToOne(MeshDescription);
+	check(FirstPolygonGroup != INDEX_NONE);
 
 	FStaticMeshAttributes Attributes(MeshDescription);
 	TPolygonGroupAttributesRef<FName> MaterialSlotNames =
@@ -97,6 +208,14 @@ void CollapseToOneMaterialSection(FMeshDescription& MeshDescription)
 	TVertexInstanceAttributesRef<FVector2f> VertexInstanceUvs =
 		Attributes.GetVertexInstanceUVs();
 	VertexInstanceUvs.SetNumChannels(1);
+
+	TVertexInstanceAttributesRef<FVector4f> VertexInstanceColors =
+		Attributes.GetVertexInstanceColors();
+	for (const FVertexInstanceID VertexInstanceId
+		: MeshDescription.VertexInstances().GetElementIDs())
+	{
+		VertexInstanceColors[VertexInstanceId] = FVector4f(1.0f);
+	}
 }
 
 void ConfigureProxyAsset(
@@ -115,6 +234,7 @@ void ConfigureProxyAsset(
 	ProxySourceModel.BuildSettings.bRecomputeNormals = false;
 	ProxySourceModel.BuildSettings.bRecomputeTangents = false;
 	ProxySourceModel.BuildSettings.bComputeWeightedNormals = false;
+	ProxySourceModel.BuildSettings.bBuildReversedIndexBuffer = false;
 	ProxySourceModel.BuildSettings.bUseHighPrecisionTangentBasis = false;
 	ProxySourceModel.BuildSettings.bUseFullPrecisionUVs = false;
 	ProxySourceModel.BuildSettings.bUseBackwardsCompatibleF16TruncUVs = false;
@@ -158,10 +278,8 @@ void ConfigureProxyAsset(
 	ProxyMesh.bSupportPhysicalMaterialMasks = false;
 	ProxyMesh.SetLightMapResolution(4);
 	ProxyMesh.SetLightMapCoordinateIndex(0);
-	ProxyMesh.SetPositiveBoundsExtension(
-		SourceMesh.GetPositiveBoundsExtension());
-	ProxyMesh.SetNegativeBoundsExtension(
-		SourceMesh.GetNegativeBoundsExtension());
+	ProxyMesh.SetPositiveBoundsExtension(FVector::ZeroVector);
+	ProxyMesh.SetNegativeBoundsExtension(FVector::ZeroVector);
 	ProxyMesh.SetLightingGuid();
 	ProxyMesh.SetAssetImportData(nullptr);
 	ProxyMesh.Sockets.Reset();
@@ -200,6 +318,13 @@ EUEPyShadowProxyBakeResult UUEPyStaticMeshAssetBridge::BakeShadowProxy(
 	OutProxyTriangleCount = 0;
 	OutSavedPackageBytes = 0;
 	OutError.Reset();
+	if (!IsInGameThread())
+	{
+		return Fail(
+			EUEPyShadowProxyBakeResult::WrongThread,
+			TEXT("Shadow-proxy baking must run on Unreal's game thread."),
+			OutError);
+	}
 
 	if (!FMath::IsFinite(TriangleFraction)
 		|| TriangleFraction < MinimumTriangleFraction
@@ -345,6 +470,13 @@ EUEPyShadowProxyBakeResult UUEPyStaticMeshAssetBridge::BakeShadowProxy(
 			TEXT("Source mesh LOD0 contains no triangles."),
 			OutError);
 	}
+	if (CollapsePolygonGroupsToOne(SourceMeshDescription) == INDEX_NONE)
+	{
+		return Fail(
+			EUEPyShadowProxyBakeResult::SourceMeshUnavailable,
+			TEXT("Source mesh LOD0 contains no polygon groups."),
+			OutError);
+	}
 
 	IMeshReductionManagerModule* ReductionManager =
 		FModuleManager::LoadModulePtr<IMeshReductionManagerModule>(
@@ -404,26 +536,26 @@ EUEPyShadowProxyBakeResult UUEPyStaticMeshAssetBridge::BakeShadowProxy(
 
 	UPackage* DestinationPackage = CreatePackage(*DestinationPackageName);
 	DestinationPackage->FullyLoad();
-	UStaticMesh* ProxyMesh = ExistingDestination;
-	if (ProxyMesh == nullptr)
-	{
-		ProxyMesh = NewObject<UStaticMesh>(
-			DestinationPackage,
-			*DestinationAssetName,
-			RF_Public | RF_Standalone | RF_Transactional);
-		ProxyMesh->InitResources();
-		FAssetRegistryModule::AssetCreated(ProxyMesh);
-	}
-
 	UAssetEditorSubsystem* AssetEditorSubsystem = GEditor != nullptr
 		? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()
 		: nullptr;
 	const bool bReopenAssetEditor = AssetEditorSubsystem != nullptr
-		&& AssetEditorSubsystem->FindEditorForAsset(ProxyMesh, false) != nullptr;
-	if (bReopenAssetEditor)
-	{
-		AssetEditorSubsystem->CloseAllEditorsForAsset(ProxyMesh);
-	}
+		&& ExistingDestination != nullptr
+		&& AssetEditorSubsystem->FindEditorForAsset(
+			ExistingDestination,
+			false) != nullptr;
+
+	const FName TemporaryProxyName = MakeUniqueObjectName(
+		GetTransientPackage(),
+		UStaticMesh::StaticClass(),
+		FName(*FString::Printf(
+			TEXT("%s_UEPyTemp"),
+			*DestinationAssetName)));
+	UStaticMesh* ProxyMesh = NewObject<UStaticMesh>(
+		GetTransientPackage(),
+		TemporaryProxyName,
+		RF_Transactional);
+	ProxyMesh->InitResources();
 
 	ConfigureProxyAsset(
 		*ProxyMesh,
@@ -433,17 +565,122 @@ EUEPyShadowProxyBakeResult UUEPyStaticMeshAssetBridge::BakeShadowProxy(
 	if (ProxyMesh->GetRenderData() == nullptr
 		|| ProxyMesh->GetRenderData()->LODResources.Num() != 1)
 	{
-		if (bReopenAssetEditor)
-		{
-			AssetEditorSubsystem->OpenEditorForAsset(ProxyMesh);
-		}
+		ProxyMesh->MarkAsGarbage();
 		return Fail(
 			EUEPyShadowProxyBakeResult::BuildFailed,
 			TEXT("The reduced source geometry could not be built as one render LOD."),
 			OutError);
 	}
+	if (!ExpandProxyBoundsToContainSource(*ProxyMesh, *SourceMesh))
+	{
+		ProxyMesh->MarkAsGarbage();
+		return Fail(
+			EUEPyShadowProxyBakeResult::BuildFailed,
+			TEXT("The shadow proxy's bounds could not be expanded to contain the source bounds."),
+			OutError);
+	}
 
-	DestinationPackage->GetMetaData();
+	if (bReopenAssetEditor)
+	{
+		AssetEditorSubsystem->CloseAllEditorsForAsset(ExistingDestination);
+	}
+
+	constexpr ERenameFlags SwapRenameFlags =
+		REN_DontCreateRedirectors | REN_NonTransactional;
+	const bool bDestinationPackageWasDirty = DestinationPackage->IsDirty();
+	UMetaData* DestinationMetadata = DestinationPackage->GetMetaData();
+	const FObjectMetadataSnapshot ExistingDestinationMetadata =
+		ExistingDestination != nullptr
+			? CaptureObjectMetadata(*ExistingDestination)
+			: FObjectMetadataSnapshot();
+	const bool bExistingWasPublic = ExistingDestination != nullptr
+		&& ExistingDestination->HasAnyFlags(RF_Public);
+	const bool bExistingWasStandalone = ExistingDestination != nullptr
+		&& ExistingDestination->HasAnyFlags(RF_Standalone);
+	bool bExistingMovedToTransient = false;
+
+	if (ExistingDestination != nullptr)
+	{
+		FAssetRegistryModule::AssetDeleted(ExistingDestination);
+		ExistingDestination->ClearFlags(RF_Public | RF_Standalone);
+		const FName PreviousAssetTemporaryName = MakeUniqueObjectName(
+			GetTransientPackage(),
+			UStaticMesh::StaticClass(),
+			FName(*FString::Printf(
+				TEXT("%s_UEPyPrevious"),
+				*DestinationAssetName)));
+		bExistingMovedToTransient = ExistingDestination->Rename(
+			*PreviousAssetTemporaryName.ToString(),
+			GetTransientPackage(),
+			SwapRenameFlags);
+		if (!bExistingMovedToTransient)
+		{
+			if (bExistingWasPublic)
+			{
+				ExistingDestination->SetFlags(RF_Public);
+			}
+			if (bExistingWasStandalone)
+			{
+				ExistingDestination->SetFlags(RF_Standalone);
+			}
+			FAssetRegistryModule::AssetCreated(ExistingDestination);
+			DestinationPackage->SetDirtyFlag(bDestinationPackageWasDirty);
+			ProxyMesh->MarkAsGarbage();
+			if (bReopenAssetEditor)
+			{
+				AssetEditorSubsystem->OpenEditorForAsset(ExistingDestination);
+			}
+			return Fail(
+				EUEPyShadowProxyBakeResult::DestinationReplaceFailed,
+				TEXT("The existing destination could not be moved aside for replacement."),
+				OutError);
+		}
+	}
+
+	const bool bProxyMovedToDestination = ProxyMesh->Rename(
+		*DestinationAssetName,
+		DestinationPackage,
+		SwapRenameFlags);
+	if (!bProxyMovedToDestination)
+	{
+		bool bExistingRestored = ExistingDestination == nullptr;
+		if (ExistingDestination != nullptr && bExistingMovedToTransient)
+		{
+			bExistingRestored = ExistingDestination->Rename(
+				*DestinationAssetName,
+				DestinationPackage,
+				SwapRenameFlags);
+			if (bExistingRestored)
+			{
+				if (bExistingWasPublic)
+				{
+					ExistingDestination->SetFlags(RF_Public);
+				}
+				if (bExistingWasStandalone)
+				{
+					ExistingDestination->SetFlags(RF_Standalone);
+				}
+				FAssetRegistryModule::AssetCreated(ExistingDestination);
+			}
+		}
+		DestinationPackage->SetDirtyFlag(bDestinationPackageWasDirty);
+		ProxyMesh->MarkAsGarbage();
+		if (bReopenAssetEditor && bExistingRestored)
+		{
+			AssetEditorSubsystem->OpenEditorForAsset(ExistingDestination);
+		}
+		return Fail(
+			EUEPyShadowProxyBakeResult::DestinationReplaceFailed,
+			bExistingRestored
+				? TEXT("The fresh shadow proxy could not be moved to the destination.")
+				: TEXT("The fresh shadow proxy could not be moved to the destination, and the previous asset could not be restored."),
+			OutError);
+	}
+
+	ProxyMesh->SetFlags(RF_Public | RF_Standalone | RF_Transactional);
+	FAssetRegistryModule::AssetCreated(ProxyMesh);
+
+	DestinationMetadata->RemoveMetaDataOutsidePackage();
 	DestinationPackage->MarkPackageDirty();
 	const FString PackageFilename = FPackageName::LongPackageNameToFilename(
 		DestinationPackageName,
@@ -456,16 +693,79 @@ EUEPyShadowProxyBakeResult UUEPyStaticMeshAssetBridge::BakeShadowProxy(
 		ProxyMesh,
 		*PackageFilename,
 		SaveArguments);
+	if (!bSaved)
+	{
+		FAssetRegistryModule::AssetDeleted(ProxyMesh);
+		ProxyMesh->ClearFlags(RF_Public | RF_Standalone);
+		const FName FailedProxyTemporaryName = MakeUniqueObjectName(
+			GetTransientPackage(),
+			UStaticMesh::StaticClass(),
+			FName(*FString::Printf(
+				TEXT("%s_UEPyFailed"),
+				*DestinationAssetName)));
+		const bool bFailedProxyMovedToTransient = ProxyMesh->Rename(
+			*FailedProxyTemporaryName.ToString(),
+			GetTransientPackage(),
+			SwapRenameFlags);
+		bool bExistingRestored = false;
+		if (ExistingDestination != nullptr
+			&& bExistingMovedToTransient
+			&& bFailedProxyMovedToTransient)
+		{
+			bExistingRestored = ExistingDestination->Rename(
+				*DestinationAssetName,
+				DestinationPackage,
+				SwapRenameFlags);
+			if (bExistingRestored)
+			{
+				if (bExistingWasPublic)
+				{
+					ExistingDestination->SetFlags(RF_Public);
+				}
+				if (bExistingWasStandalone)
+				{
+					ExistingDestination->SetFlags(RF_Standalone);
+				}
+				FAssetRegistryModule::AssetCreated(ExistingDestination);
+				RestoreObjectMetadata(
+					*DestinationMetadata,
+					ExistingDestinationMetadata);
+			}
+		}
+		const bool bRollbackSucceeded = bFailedProxyMovedToTransient
+			&& (ExistingDestination == nullptr || bExistingRestored);
+		DestinationPackage->SetDirtyFlag(bDestinationPackageWasDirty);
+		if (bFailedProxyMovedToTransient)
+		{
+			ProxyMesh->MarkAsGarbage();
+		}
+		if (bReopenAssetEditor && bExistingRestored)
+		{
+			AssetEditorSubsystem->OpenEditorForAsset(ExistingDestination);
+		}
+		return Fail(
+			EUEPyShadowProxyBakeResult::SaveFailed,
+			bRollbackSucceeded
+				? (ExistingDestination != nullptr
+					? TEXT("The shadow-proxy package could not be saved; the previous destination was restored.")
+					: TEXT("The shadow-proxy package could not be saved; the unsaved destination was discarded."))
+				: TEXT("The shadow-proxy package could not be saved, and its in-memory state could not be rolled back."),
+			OutError);
+	}
+
+	if (ExistingDestination != nullptr)
+	{
+		const TSet<FName> DirtyPackageNamesBeforeReplacement =
+			CaptureDirtyPackageNames();
+		TArray<UObject*> ObjectsToReplace = {ExistingDestination};
+		ObjectTools::ForceReplaceReferences(ProxyMesh, ObjectsToReplace);
+		RestorePreviouslyCleanPackages(
+			DirtyPackageNamesBeforeReplacement);
+		ExistingDestination->MarkAsGarbage();
+	}
 	if (bReopenAssetEditor)
 	{
 		AssetEditorSubsystem->OpenEditorForAsset(ProxyMesh);
-	}
-	if (!bSaved)
-	{
-		return Fail(
-			EUEPyShadowProxyBakeResult::SaveFailed,
-			TEXT("The shadow-proxy package could not be saved."),
-			OutError);
 	}
 
 	OutSavedPackageBytes = FMath::Max<int64>(

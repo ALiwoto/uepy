@@ -107,7 +107,7 @@ def _parser() -> argparse.ArgumentParser:
     shadow_proxy.add_argument(
         "--force",
         action="store_true",
-        help="rebuild an existing SM_Name_Shadow asset in place",
+        help="replace an existing SM_Name_Shadow with a freshly built asset",
     )
 
     animation = commands.add_parser(

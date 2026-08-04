@@ -82,9 +82,11 @@ carefully before using `--force`.
 `shadow-proxy` uses uepy's own generic `UEPyEditorBridge` plugin to create
 `SM_Name_Shadow` beside a source StaticMesh. The default retains 1% of the
 source triangles, writes the reduced geometry as the destination's only baked
-source LOD0, removes unnecessary collision and rendering data, and saves the
-package. It requires bridge version 0.3.0 or newer. An explicit destination is
-also supported:
+source LOD0, collapses material groups before reduction so obsolete material
+boundaries do not constrain simplification, expands its culling bounds to
+contain the source mesh's final bounds, removes unnecessary collision and
+rendering data, and saves the package. It requires bridge version 0.3.0 or
+newer. An explicit destination is also supported:
 
 ```powershell
 uepy shadow-proxy /Game/World/Architecture/SM_Wall
@@ -93,8 +95,9 @@ uepy shadow-proxy /Game/World/Architecture/SM_Wall --percent 2.5 --force
 ```
 
 An existing proxy is never changed unless `--force` is supplied. Forced
-rebuilding updates the StaticMesh object in place so actors holding hard
-references continue to reference the rebuilt proxy.
+rebuilding creates a fresh StaticMesh, redirects references in objects that are
+already loaded, replaces the destination at the same object path, and leaves
+unloaded references to resolve that path normally when they are loaded.
 
 `material` reports effective rendering properties, the complete parent chain,
 base-property overrides, scalar/vector/texture/static-switch parameters, used
@@ -374,7 +377,7 @@ appropriate.
   set properties, save packages, import content, or delete data. `duplicate`
   and `shadow-proxy` are explicit exceptions. Both create and save destination
   assets and require `--force` before replacing one; `duplicate` deletes its
-  destination first, while `shadow-proxy` rebuilds a StaticMesh in place so
-  existing hard references remain valid.
+  destination first, while `shadow-proxy` builds a fresh StaticMesh and
+  redirects already-loaded references before retiring the previous object.
 - Live queries run on the editor's main thread. Keep them small and do not issue
   concurrent commands while the editor is busy.

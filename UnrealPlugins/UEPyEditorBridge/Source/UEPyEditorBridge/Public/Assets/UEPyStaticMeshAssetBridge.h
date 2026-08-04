@@ -21,6 +21,8 @@ enum class EUEPyShadowProxyBakeResult : uint8
 	DestinationClassConflict = 10,
 	BuildFailed = 11,
 	SaveFailed = 12,
+	WrongThread = 13,
+	DestinationReplaceFailed = 14,
 };
 
 /** Generic editor-only StaticMesh asset operations exposed to Unreal Python. */
@@ -34,8 +36,8 @@ public:
 	/**
 	 * Reduces source LOD0 and saves the reduced geometry as the destination's
 	 * only baked source LOD0. An empty destination creates a sibling named
-	 * SourceName_Shadow. Existing destinations require bForce and are updated
-	 * in place so hard references remain valid.
+	 * SourceName_Shadow. Existing destinations require bForce and are replaced
+	 * with a fresh mesh while already-loaded references are redirected.
 	 */
 	UFUNCTION(BlueprintCallable, Category="uepy|Assets|Static Mesh")
 	static EUEPyShadowProxyBakeResult BakeShadowProxy(
