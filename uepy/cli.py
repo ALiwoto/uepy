@@ -31,9 +31,13 @@ def _parser() -> argparse.ArgumentParser:
         description="Inspect a running Unreal Editor through Python Remote Execution.",
     )
     parser.add_argument("--engine-root", help="Unreal installation or Engine directory")
-    parser.add_argument("--project", help="Select a discovered editor by project name/path")
+    parser.add_argument(
+        "--project", help="Select a discovered editor by project name/path"
+    )
     parser.add_argument("--node", help="Select a discovered editor by node ID prefix")
-    parser.add_argument("--timeout", type=float, default=2.0, help="discovery time in seconds")
+    parser.add_argument(
+        "--timeout", type=float, default=2.0, help="discovery time in seconds"
+    )
     parser.add_argument("--compact", action="store_true", help="emit compact JSON")
 
     commands = parser.add_subparsers(dest="command", required=True)
@@ -54,13 +58,27 @@ def _parser() -> argparse.ArgumentParser:
     actor.add_argument("--limit", type=_positive_limit, default=10)
 
     descriptors = commands.add_parser(
-        "descriptors", help="inspect World Partition actor descriptors, including unloaded actors"
+        "descriptors",
+        help="inspect World Partition actor descriptors, including unloaded actors",
     )
     descriptors.add_argument("--match", help="case-insensitive label/name substring")
     descriptors.add_argument("--limit", type=_positive_limit, default=10)
 
     asset = commands.add_parser("asset", help="inspect a saved Unreal asset")
     asset.add_argument("path", help="/Game object or package path")
+
+    duplicate = commands.add_parser(
+        "duplicate", help="duplicate and save an Unreal asset"
+    )
+    duplicate.add_argument("source", help="source /Game object or package path")
+    duplicate.add_argument(
+        "destination", help="destination /Game object or package path"
+    )
+    duplicate.add_argument(
+        "--force",
+        action="store_true",
+        help="replace the destination asset if it already exists",
+    )
 
     animation = commands.add_parser(
         "animation", help="inspect or precisely edit an Animation Sequence"
@@ -90,7 +108,9 @@ def _parser() -> argparse.ArgumentParser:
         "blueprint", help="inspect nodes, pins, and connections in a Blueprint graph"
     )
     blueprint.add_argument("path", help="/Game path to a Blueprint asset")
-    blueprint.add_argument("--graph", required=True, help="graph name, such as AnimGraph")
+    blueprint.add_argument(
+        "--graph", required=True, help="graph name, such as AnimGraph"
+    )
     blueprint.add_argument(
         "--patch",
         type=Path,
@@ -107,7 +127,9 @@ def _parser() -> argparse.ArgumentParser:
         help="acknowledge that applying a graph patch mutates editor state",
     )
 
-    mesh = commands.add_parser("mesh", help="inspect static-mesh bounds, LODs, and materials")
+    mesh = commands.add_parser(
+        "mesh", help="inspect static-mesh bounds, LODs, and materials"
+    )
     mesh.add_argument("path", help="/Game path to a StaticMesh")
 
     material = commands.add_parser(
@@ -127,7 +149,9 @@ def _parser() -> argparse.ArgumentParser:
         help="maximum asset dependencies and referencers to return",
     )
 
-    evaluate = commands.add_parser("eval", help="run an arbitrary expression (not read-only enforced)")
+    evaluate = commands.add_parser(
+        "eval", help="run an arbitrary expression (not read-only enforced)"
+    )
     evaluate.add_argument("expression")
     evaluate.add_argument(
         "--unsafe",
@@ -135,7 +159,9 @@ def _parser() -> argparse.ArgumentParser:
         help="acknowledge that arbitrary Unreal Python can mutate editor state",
     )
 
-    execute = commands.add_parser("exec", help="run arbitrary Python (not read-only enforced)")
+    execute = commands.add_parser(
+        "exec", help="run arbitrary Python (not read-only enforced)"
+    )
     source = execute.add_mutually_exclusive_group(required=True)
     source.add_argument("--code", help="literal multiline Python code")
     source.add_argument("--file", type=Path, help="local Python file to send to Unreal")
@@ -208,6 +234,12 @@ def main(argv: list[str] | None = None) -> int:
                 query_body = queries.actor_descriptors(args.match, args.limit)
             elif args.command == "asset":
                 query_body = queries.asset(args.path)
+            elif args.command == "duplicate":
+                query_body = queries.duplicate_asset(
+                    args.source,
+                    args.destination,
+                    force=args.force,
+                )
             elif args.command == "animation":
                 if args.promote_frame is None:
                     query_body = queries.animation(args.path)
@@ -238,7 +270,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             if query_body is not None:
-                _emit(client.query(query_body), args.compact)
+                result = client.query(query_body)
+                if args.command == "duplicate" and not result.get("duplicated", False):
+                    error = result.get("error", "Unreal could not duplicate the asset.")
+                    print(f"uepy: error: {error}", file=sys.stderr)
+                    return 1
+                _emit(result, args.compact)
                 return 0
 
             if args.command in {"eval", "exec"} and not args.unsafe:

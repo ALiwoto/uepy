@@ -60,11 +60,23 @@ uepy actors --match Village
 uepy actor BP_VillageGate
 uepy descriptors --match Village
 uepy asset /Game/LevelPrototyping/Meshes/SM_Cube
+uepy duplicate /Game/VFX/N_Source /Game/Peacebound/VFX/N_Derived
 uepy animation /Game/Characters/Hero/Animations/A_SpellPose
 uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph
 uepy mesh /Game/LevelPrototyping/Meshes/SM_Cube
 uepy material /Game/Materials/MI_Example
 ```
+
+`duplicate` creates and saves an independent asset at the destination. It
+refuses to replace an existing destination unless `--force` is supplied:
+
+```powershell
+uepy duplicate /Game/VFX/N_Source /Game/Peacebound/VFX/N_Derived --force
+```
+
+When forced, the existing destination asset is deleted before the replacement
+is duplicated and saved. The source and destination must therefore be reviewed
+carefully before using `--force`.
 
 `material` reports effective rendering properties, the complete parent chain,
 base-property overrides, scalar/vector/texture/static-switch parameters, used
@@ -340,7 +352,9 @@ appropriate.
 - This is editor tooling, not packaged-game runtime integration.
 - Python exposes Unreal-reflected APIs. Some non-reflected C++ internals may
   require a small editor-only C++ bridge.
-- Inspection can load a requested asset into editor memory, but the built-in
-  commands never set properties, save packages, import content, or delete data.
+- Inspection commands can load a requested asset into editor memory but never
+  set properties, save packages, import content, or delete data. `duplicate` is
+  an explicit exception: it creates and saves its destination, and `--force`
+  deletes an existing destination first.
 - Live queries run on the editor's main thread. Keep them small and do not issue
   concurrent commands while the editor is busy.

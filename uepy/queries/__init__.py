@@ -2,7 +2,7 @@
 
 from .actors import actor, actor_descriptors, actors, selected
 from .animations import animation, promote_animation_frame
-from .assets import asset
+from .assets import asset, duplicate_asset
 from .blueprints import blueprint, blueprint_patch
 from .material import material
 from .mesh import mesh
@@ -16,6 +16,7 @@ __all__ = [
     "asset",
     "blueprint",
     "blueprint_patch",
+    "duplicate_asset",
     "material",
     "mesh",
     "promote_animation_frame",
