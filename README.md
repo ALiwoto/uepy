@@ -46,6 +46,10 @@ uepy world
 uepy selected
 ```
 
+`uepy world` reports the active PIE/game world while play is running and the
+editor world otherwise. It also has a live-world fallback for editor travel
+windows in which Unreal's editor subsystem temporarily returns no world.
+
 Without installation, `python -m uepy ...` remains available while the current
 directory is this repository.
 
