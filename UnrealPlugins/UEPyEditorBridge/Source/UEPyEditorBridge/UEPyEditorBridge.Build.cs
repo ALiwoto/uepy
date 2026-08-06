@@ -22,6 +22,8 @@ public class UEPyEditorBridge : ModuleRules
 			"MeshDescription",
 			"MeshReductionInterface",
 			"MeshUtilitiesCommon",
+			"Niagara",
+			"NiagaraEditor",
 			"StaticMeshDescription",
 			"UnrealEd"
 		});
