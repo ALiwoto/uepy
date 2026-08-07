@@ -25,6 +25,7 @@ public class UEPyEditorBridge : ModuleRules
 			"Niagara",
 			"NiagaraEditor",
 			"StaticMeshDescription",
+			"UEWavComp",
 			"UnrealEd"
 		});
 	}

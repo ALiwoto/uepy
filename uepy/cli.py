@@ -89,6 +89,26 @@ def _parser() -> argparse.ArgumentParser:
         help="replace the destination asset if it already exists",
     )
 
+    extract_audio = commands.add_parser(
+        "extract-audio",
+        help="extract embedded RIFF/WAVE payloads from .uasset package files",
+    )
+    extract_audio.add_argument(
+        "source",
+        type=Path,
+        help="source .uasset file or directory to search recursively",
+    )
+    extract_audio.add_argument(
+        "destination",
+        type=Path,
+        help="filesystem directory for extracted .wav files",
+    )
+    extract_audio.add_argument(
+        "--force",
+        action="store_true",
+        help="replace extracted .wav files that already exist",
+    )
+
     shadow_proxy = commands.add_parser(
         "shadow-proxy",
         help="bake and save a simplified sibling StaticMesh for shadows",
@@ -270,6 +290,12 @@ def main(argv: list[str] | None = None) -> int:
                     args.destination,
                     force=args.force,
                 )
+            elif args.command == "extract-audio":
+                query_body = queries.extract_embedded_audio(
+                    str(args.source.resolve()),
+                    str(args.destination.resolve()),
+                    force=args.force,
+                )
             elif args.command == "shadow-proxy":
                 query_body = queries.bake_shadow_proxy(
                     args.source,
@@ -315,6 +341,14 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "shadow-proxy" and not result.get("baked", False):
                     error = result.get(
                         "error", "Unreal could not bake the shadow proxy."
+                    )
+                    print(f"uepy: error: {error}", file=sys.stderr)
+                    return 1
+                if args.command == "extract-audio" and not result.get(
+                    "extracted", False
+                ):
+                    error = result.get(
+                        "error", "Unreal could not extract embedded audio."
                     )
                     print(f"uepy: error: {error}", file=sys.stderr)
                     return 1

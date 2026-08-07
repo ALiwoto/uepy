@@ -5,6 +5,59 @@ from __future__ import annotations
 import json
 
 
+def extract_embedded_audio(
+    source_path: str,
+    destination_directory: str,
+    force: bool = False,
+) -> str:
+    source_literal = json.dumps(source_path)
+    destination_literal = json.dumps(destination_directory)
+    force_literal = "True" if force else "False"
+    return f"""
+_uepy_source_path = {source_literal}
+_uepy_destination_directory = {destination_literal}
+_uepy_force = {force_literal}
+_uepy_result = {{
+    "extracted": False,
+    "source": _uepy_source_path,
+    "destination": _uepy_destination_directory,
+    "forced": _uepy_force,
+}}
+_uepy_bridge = getattr(unreal, "UEPyAudioAssetBridge", None)
+_uepy_result_enum = getattr(unreal, "UEPyEmbeddedAudioExtractionResult", None)
+if _uepy_bridge is None or _uepy_result_enum is None:
+    _uepy_result["error"] = (
+        "UEPyEditorBridge 0.4.0 or newer is required for embedded-audio extraction."
+    )
+else:
+    (
+        _uepy_extraction_result,
+        _uepy_scanned_packages,
+        _uepy_extracted_waves,
+        _uepy_skipped_packages,
+        _uepy_failed_packages,
+        _uepy_written_files,
+        _uepy_errors,
+    ) = _uepy_bridge.extract_embedded_wave_audio(
+        _uepy_source_path,
+        _uepy_destination_directory,
+        _uepy_force,
+    )
+    _uepy_result.update({{
+        "extracted": _uepy_extraction_result == _uepy_result_enum.SUCCESS,
+        "result": str(_uepy_extraction_result),
+        "scanned_packages": _uepy_scanned_packages,
+        "extracted_waves": _uepy_extracted_waves,
+        "skipped_packages": _uepy_skipped_packages,
+        "failed_packages": _uepy_failed_packages,
+        "written_files": list(_uepy_written_files),
+        "errors": list(_uepy_errors),
+    }})
+    if _uepy_errors:
+        _uepy_result["error"] = _uepy_errors[0]
+"""
+
+
 def asset(path: str) -> str:
     path_literal = json.dumps(path)
     return f"""

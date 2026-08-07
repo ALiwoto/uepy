@@ -30,15 +30,17 @@ class UEPYEDITORBRIDGE_API UUEPyNiagaraAssetBridge final
 
 public:
 	/**
-	 * Enables or disables named emitter handles and function-call nodes in an
-	 * existing Niagara system. Module selectors use "EmitterName:ModuleName".
-	 * All selectors are validated before the system is modified.
+	 * Edits named emitter enabled/local-space states and function-call nodes in
+	 * an existing Niagara system. Module selectors use
+	 * "EmitterName:ModuleName". All selectors are validated before mutation.
 	 */
 	UFUNCTION(BlueprintCallable, Category="uepy|Assets|Niagara")
 	static EUEPyNiagaraEditResult EditSystem(
 		const FString& SystemObjectPath,
 		const TArray<FName>& EmittersToDisable,
 		const TArray<FName>& EmittersToEnable,
+		const TArray<FName>& EmittersToSetWorldSpace,
+		const TArray<FName>& EmittersToSetLocalSpace,
 		const TArray<FString>& ModulesToDisable,
 		const TArray<FString>& ModulesToEnable,
 		bool bSave,

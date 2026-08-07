@@ -137,6 +137,88 @@ class DuplicateAssetCliTests(unittest.TestCase):
         self.assertIn("already exists", stderr.getvalue())
 
 
+class ExtractEmbeddedAudioQueryTests(unittest.TestCase):
+    def test_builds_success_report(self) -> None:
+        success = object()
+
+        class AudioBridge:
+            @staticmethod
+            def extract_embedded_wave_audio(
+                source: str, destination: str, force: bool
+            ):
+                self.assertEqual(source, r"C:\Pack")
+                self.assertEqual(destination, r"C:\Output")
+                self.assertTrue(force)
+                return (
+                    success,
+                    3,
+                    2,
+                    1,
+                    0,
+                    [r"C:\Output\A.wav", r"C:\Output\B.wav"],
+                    [],
+                )
+
+        unreal = SimpleNamespace(
+            UEPyAudioAssetBridge=AudioBridge,
+            UEPyEmbeddedAudioExtractionResult=SimpleNamespace(SUCCESS=success),
+        )
+        scope = {"unreal": unreal}
+        exec(
+            queries.extract_embedded_audio(
+                r"C:\Pack",
+                r"C:\Output",
+                force=True,
+            ),
+            scope,
+        )
+
+        result = scope["_uepy_result"]
+        self.assertTrue(result["extracted"])
+        self.assertEqual(result["scanned_packages"], 3)
+        self.assertEqual(result["extracted_waves"], 2)
+        self.assertEqual(result["skipped_packages"], 1)
+        self.assertEqual(len(result["written_files"]), 2)
+
+    def test_reports_missing_bridge(self) -> None:
+        scope = {"unreal": SimpleNamespace()}
+        exec(
+            queries.extract_embedded_audio(r"C:\Pack", r"C:\Output"),
+            scope,
+        )
+
+        result = scope["_uepy_result"]
+        self.assertFalse(result["extracted"])
+        self.assertIn("0.4.0", result["error"])
+
+
+class ExtractEmbeddedAudioCliTests(unittest.TestCase):
+    def test_failed_extraction_returns_nonzero(self) -> None:
+        class FakeClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                return None
+
+            def query(self, body: str) -> dict:
+                self.body = body
+                return {
+                    "extracted": False,
+                    "error": "Destination exists; pass --force to replace it.",
+                }
+
+        stderr = io.StringIO()
+        with patch("uepy.cli._client", return_value=FakeClient()):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = main(
+                    ["extract-audio", "Source", "Destination"]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("--force", stderr.getvalue())
+
+
 class ShadowProxyQueryTests(unittest.TestCase):
     def test_builds_success_report(self) -> None:
         success = object()

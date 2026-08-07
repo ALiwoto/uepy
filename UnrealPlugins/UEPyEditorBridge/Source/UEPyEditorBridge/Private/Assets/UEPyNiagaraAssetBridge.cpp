@@ -12,6 +12,7 @@
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UnrealType.h"
 
 namespace
 {
@@ -78,12 +79,21 @@ bool FunctionNameMatches(
 			ESearchCase::IgnoreCase);
 }
 
+struct FUEPyResolvedLocalSpaceEdit
+{
+	FVersionedNiagaraEmitter VersionedEmitter;
+	FVersionedNiagaraEmitterData* EmitterData = nullptr;
+	bool bLocalSpace = false;
+};
+
 }
 
 EUEPyNiagaraEditResult UUEPyNiagaraAssetBridge::EditSystem(
 	const FString& SystemObjectPath,
 	const TArray<FName>& EmittersToDisable,
 	const TArray<FName>& EmittersToEnable,
+	const TArray<FName>& EmittersToSetWorldSpace,
+	const TArray<FName>& EmittersToSetLocalSpace,
 	const TArray<FString>& ModulesToDisable,
 	const TArray<FString>& ModulesToEnable,
 	const bool bSave,
@@ -185,6 +195,92 @@ EUEPyNiagaraEditResult UUEPyNiagaraAssetBridge::EditSystem(
 				OutError);
 		}
 		ResolvedEmitterEdits.Add(Handle, Edit.Value);
+	}
+
+	TMap<FName, bool> LocalSpaceEdits;
+	auto AddLocalSpaceEdits = [&](const TArray<FName>& EmitterNames,
+		const bool bLocalSpace) -> EUEPyNiagaraEditResult
+	{
+		for (const FName EmitterName : EmitterNames)
+		{
+			if (EmitterName.IsNone())
+			{
+				return Fail(
+					EUEPyNiagaraEditResult::EmitterNotFound,
+					TEXT("Emitter names cannot be empty."),
+					OutError);
+			}
+			if (const bool* ExistingSpace = LocalSpaceEdits.Find(EmitterName))
+			{
+				if (*ExistingSpace != bLocalSpace)
+				{
+					return Fail(
+						EUEPyNiagaraEditResult::ConflictingEdit,
+						FString::Printf(
+							TEXT("Emitter '%s' was requested as both world-space and local-space."),
+							*EmitterName.ToString()),
+						OutError);
+				}
+				continue;
+			}
+			LocalSpaceEdits.Add(EmitterName, bLocalSpace);
+		}
+		return EUEPyNiagaraEditResult::Success;
+	};
+
+	Result = AddLocalSpaceEdits(EmittersToSetWorldSpace, false);
+	if (Result != EUEPyNiagaraEditResult::Success)
+	{
+		return Result;
+	}
+	Result = AddLocalSpaceEdits(EmittersToSetLocalSpace, true);
+	if (Result != EUEPyNiagaraEditResult::Success)
+	{
+		return Result;
+	}
+
+	TArray<FUEPyResolvedLocalSpaceEdit> ResolvedLocalSpaceEdits;
+	for (const TPair<FName, bool>& Edit : LocalSpaceEdits)
+	{
+		FNiagaraEmitterHandle* Handle = FindEmitterHandle(*System, Edit.Key);
+		if (Handle == nullptr)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::EmitterNotFound,
+				FString::Printf(
+					TEXT("Emitter '%s' was not found in '%s'."),
+					*Edit.Key.ToString(),
+					*NormalizedSystemPath),
+				OutError);
+		}
+		if (Handle->GetEmitterMode() != ENiagaraEmitterMode::Standard)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::UnsupportedEmitter,
+				FString::Printf(
+					TEXT("Emitter '%s' is stateless and has no local-space setting."),
+					*Edit.Key.ToString()),
+				OutError);
+		}
+
+		const FVersionedNiagaraEmitter VersionedEmitter =
+			Handle->GetInstance();
+		FVersionedNiagaraEmitterData* EmitterData =
+			VersionedEmitter.GetEmitterData();
+		if (VersionedEmitter.Emitter == nullptr || EmitterData == nullptr)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::UnsupportedEmitter,
+				FString::Printf(
+					TEXT("Emitter '%s' has no editable version data."),
+					*Edit.Key.ToString()),
+				OutError);
+		}
+
+		ResolvedLocalSpaceEdits.Add({
+			VersionedEmitter,
+			EmitterData,
+			Edit.Value});
 	}
 
 	TMap<UNiagaraNodeFunctionCall*, bool> ResolvedModuleEdits;
@@ -337,6 +433,10 @@ EUEPyNiagaraEditResult UUEPyNiagaraAssetBridge::EditSystem(
 			: ENodeEnabledState::Disabled;
 		bHasChanges |= Edit.Key->GetDesiredEnabledState() != DesiredState;
 	}
+	for (const FUEPyResolvedLocalSpaceEdit& Edit : ResolvedLocalSpaceEdits)
+	{
+		bHasChanges |= Edit.EmitterData->bLocalSpace != Edit.bLocalSpace;
+	}
 	if (!bHasChanges)
 	{
 		return EUEPyNiagaraEditResult::Success;
@@ -349,6 +449,37 @@ EUEPyNiagaraEditResult UUEPyNiagaraAssetBridge::EditSystem(
 		if (Edit.Key->SetIsEnabled(Edit.Value, *System, false))
 		{
 			++OutChangedEmitterCount;
+		}
+	}
+
+	TArray<FUEPyResolvedLocalSpaceEdit*> ChangedLocalSpaceEdits;
+	for (FUEPyResolvedLocalSpaceEdit& Edit : ResolvedLocalSpaceEdits)
+	{
+		if (Edit.EmitterData->bLocalSpace == Edit.bLocalSpace)
+		{
+			continue;
+		}
+		Edit.VersionedEmitter.Emitter->Modify();
+		Edit.EmitterData->bLocalSpace = Edit.bLocalSpace;
+		ChangedLocalSpaceEdits.Add(&Edit);
+		++OutChangedEmitterCount;
+	}
+	if (!ChangedLocalSpaceEdits.IsEmpty())
+	{
+		FProperty* LocalSpaceProperty = FindFProperty<FProperty>(
+			FVersionedNiagaraEmitterData::StaticStruct(),
+			GET_MEMBER_NAME_CHECKED(
+				FVersionedNiagaraEmitterData,
+				bLocalSpace));
+		check(LocalSpaceProperty != nullptr);
+		for (FUEPyResolvedLocalSpaceEdit* Edit : ChangedLocalSpaceEdits)
+		{
+			FPropertyChangedEvent PropertyChangedEvent(
+				LocalSpaceProperty,
+				EPropertyChangeType::ValueSet);
+			Edit->VersionedEmitter.Emitter->PostEditChangeVersionedProperty(
+				PropertyChangedEvent,
+				Edit->VersionedEmitter.Version);
 		}
 	}
 

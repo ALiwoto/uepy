@@ -65,6 +65,7 @@ uepy actor BP_VillageGate
 uepy descriptors --match Village
 uepy asset /Game/LevelPrototyping/Meshes/SM_Cube
 uepy duplicate /Game/VFX/N_Source /Game/Derived/VFX/N_Derived
+uepy extract-audio ./Content/AudioPack ./ExtractedAudio
 uepy shadow-proxy /Game/World/SM_Wall
 uepy animation /Game/Characters/Hero/Animations/A_SpellPose
 uepy blueprint /Game/Characters/Hero/Animations/ABP_Hero --graph AnimGraph
@@ -82,6 +83,24 @@ uepy duplicate /Game/VFX/N_Source /Game/Derived/VFX/N_Derived --force
 When forced, the existing destination asset is deleted before the replacement
 is duplicated and saved. The source and destination must therefore be reviewed
 carefully before using `--force`.
+
+`extract-audio` recovers embedded RIFF/WAVE source payloads from Unreal
+`.uasset` package files without loading those packages as assets. This is useful
+when a `USoundWave` package was saved by an Unreal version newer than the
+currently running editor, but still contains its imported source audio in an
+Unreal compressed buffer. A source directory is searched recursively and its
+folder structure is preserved in the destination:
+
+```powershell
+uepy extract-audio ./Content/AudioPack ./ExtractedAudio
+uepy extract-audio ./Content/AudioPack ./ExtractedAudio --force
+```
+
+The operation requires `UEPyEditorBridge` 0.4.0 or newer. Existing WAV files
+are rejected before extraction begins unless `--force` is supplied. Packages
+without embedded WAVE source data, such as MetaSound graphs, are skipped.
+Embedded PCM transformed with Unreal's lossless `UEWavComp` representation is
+decoded and written as an ordinary 16-bit PCM WAV.
 
 `shadow-proxy` uses uepy's own generic `UEPyEditorBridge` plugin to create
 `SM_Name_Shadow` beside a source StaticMesh. The default retains 1% of the
