@@ -1,7 +1,11 @@
 #include "Assets/UEPyNiagaraAssetBridge.h"
 
+#include "EdGraph/EdGraphPin.h"
+#include "EdGraphSchema_Niagara.h"
+#include "INiagaraEditorTypeUtilities.h"
 #include "EdGraph/EdGraphNode.h"
 #include "Misc/PackageName.h"
+#include "NiagaraEditorModule.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraGraph.h"
@@ -9,6 +13,8 @@
 #include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
 #include "NiagaraSystem.h"
+#include "ViewModels/Stack/NiagaraParameterHandle.h"
+#include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
 #include "UObject/UObjectGlobals.h"
@@ -85,6 +91,45 @@ struct FUEPyResolvedLocalSpaceEdit
 	FVersionedNiagaraEmitterData* EmitterData = nullptr;
 	bool bLocalSpace = false;
 };
+
+struct FUEPyResolvedModuleInputEdit
+{
+	UNiagaraNodeFunctionCall* FunctionCall = nullptr;
+	FNiagaraVariable InputVariable;
+	FString CanonicalValue;
+	FString Selector;
+};
+
+bool SplitModuleInputSelector(
+	const FString& Selector,
+	FString& OutEmitterName,
+	FString& OutModuleName,
+	FString& OutInputName)
+{
+	FString Remainder;
+	if (!Selector.Split(
+		TEXT(":"),
+		&OutEmitterName,
+		&Remainder,
+		ESearchCase::CaseSensitive,
+		ESearchDir::FromStart)
+		|| !Remainder.Split(
+			TEXT(":"),
+			&OutModuleName,
+			&OutInputName,
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart))
+	{
+		return false;
+	}
+
+	OutEmitterName.TrimStartAndEndInline();
+	OutModuleName.TrimStartAndEndInline();
+	OutInputName.TrimStartAndEndInline();
+	return !OutEmitterName.IsEmpty()
+		&& !OutModuleName.IsEmpty()
+		&& !OutInputName.IsEmpty();
+}
 
 }
 
@@ -513,6 +558,314 @@ EUEPyNiagaraEditResult UUEPyNiagaraAssetBridge::EditSystem(
 	}
 	System->WaitForCompilationComplete(false, false);
 
+	UPackage* Package = System->GetOutermost();
+	const FString PackageName = Package->GetName();
+	const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+		PackageName,
+		FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArguments;
+	SaveArguments.TopLevelFlags = RF_Public | RF_Standalone;
+	SaveArguments.SaveFlags = SAVE_NoError;
+	if (!UPackage::SavePackage(
+		Package,
+		System,
+		*PackageFilename,
+		SaveArguments))
+	{
+		return Fail(
+			EUEPyNiagaraEditResult::SaveFailed,
+			FString::Printf(
+				TEXT("Niagara system package '%s' could not be saved."),
+				*PackageName),
+			OutError);
+	}
+
+	return EUEPyNiagaraEditResult::Success;
+}
+
+EUEPyNiagaraEditResult UUEPyNiagaraAssetBridge::SetModuleInputValues(
+	const FString& SystemObjectPath,
+	const TMap<FString, FString>& ModuleInputValues,
+	const bool bSave,
+	int32& OutChangedInputCount,
+	FString& OutError)
+{
+	OutChangedInputCount = 0;
+	OutError.Reset();
+	if (!IsInGameThread())
+	{
+		return Fail(
+			EUEPyNiagaraEditResult::WrongThread,
+			TEXT("Niagara asset editing must run on Unreal's game thread."),
+			OutError);
+	}
+
+	const FString NormalizedSystemPath =
+		NormalizeNiagaraObjectPath(SystemObjectPath);
+	if (!FPackageName::IsValidObjectPath(NormalizedSystemPath))
+	{
+		return Fail(
+			EUEPyNiagaraEditResult::InvalidSystemPath,
+			TEXT("System must be a valid mounted Unreal object or package path."),
+			OutError);
+	}
+
+	UNiagaraSystem* System = LoadObject<UNiagaraSystem>(
+		nullptr,
+		*NormalizedSystemPath,
+		nullptr,
+		LOAD_NoWarn | LOAD_Quiet);
+	if (System == nullptr)
+	{
+		return Fail(
+			EUEPyNiagaraEditResult::SystemNotFound,
+			TEXT("Asset was not found or is not a Niagara system."),
+			OutError);
+	}
+	System->WaitForCompilationComplete(false, false);
+
+	TArray<FUEPyResolvedModuleInputEdit> ResolvedEdits;
+	ResolvedEdits.Reserve(ModuleInputValues.Num());
+	for (const TPair<FString, FString>& RequestedEdit : ModuleInputValues)
+	{
+		const FString Selector = RequestedEdit.Key.TrimStartAndEnd();
+		FString EmitterName;
+		FString ModuleName;
+		FString InputName;
+		if (!SplitModuleInputSelector(
+			Selector,
+			EmitterName,
+			ModuleName,
+			InputName))
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::InvalidInputSelector,
+				FString::Printf(
+					TEXT("Module input selector '%s' must use 'EmitterName:ModuleName:InputName'."),
+					*Selector),
+				OutError);
+		}
+
+		FNiagaraEmitterHandle* Handle = FindEmitterHandle(
+			*System,
+			FName(*EmitterName));
+		if (Handle == nullptr)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::EmitterNotFound,
+				FString::Printf(
+					TEXT("Emitter '%s' from selector '%s' was not found."),
+					*EmitterName,
+					*Selector),
+				OutError);
+		}
+		if (Handle->GetEmitterMode() != ENiagaraEmitterMode::Standard)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::UnsupportedEmitter,
+				FString::Printf(
+					TEXT("Emitter '%s' is stateless and has no editable Niagara graph."),
+					*EmitterName),
+				OutError);
+		}
+
+		FVersionedNiagaraEmitterData* EmitterData =
+			Handle->GetEmitterData();
+		UNiagaraScriptSource* ScriptSource = EmitterData != nullptr
+			? Cast<UNiagaraScriptSource>(EmitterData->GraphSource)
+			: nullptr;
+		UNiagaraGraph* Graph = ScriptSource != nullptr
+			? ScriptSource->NodeGraph
+			: nullptr;
+		if (Graph == nullptr)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::UnsupportedEmitter,
+				FString::Printf(
+					TEXT("Emitter '%s' has no editable Niagara graph."),
+					*EmitterName),
+				OutError);
+		}
+
+		TArray<UNiagaraNodeFunctionCall*> ModuleMatches;
+		Graph->GetNodesOfClass(ModuleMatches);
+		ModuleMatches.RemoveAll(
+			[&](const UNiagaraNodeFunctionCall* FunctionCall)
+			{
+				return FunctionCall == nullptr
+					|| !FunctionNameMatches(*FunctionCall, ModuleName);
+			});
+		if (ModuleMatches.IsEmpty())
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::ModuleNotFound,
+				FString::Printf(
+					TEXT("Module '%s' was not found in emitter '%s'."),
+					*ModuleName,
+					*EmitterName),
+				OutError);
+		}
+		if (ModuleMatches.Num() > 1)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::ModuleAmbiguous,
+				FString::Printf(
+					TEXT("Module '%s' occurs %d times in emitter '%s'."),
+					*ModuleName,
+					ModuleMatches.Num(),
+					*EmitterName),
+				OutError);
+		}
+
+		UNiagaraNodeFunctionCall* FunctionCall = ModuleMatches[0];
+		UNiagaraGraph* CalledGraph = FunctionCall->GetCalledGraph();
+		if (CalledGraph == nullptr)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::UnsupportedEmitter,
+				FString::Printf(
+					TEXT("Module '%s' in emitter '%s' has no called graph."),
+					*ModuleName,
+					*EmitterName),
+				OutError);
+		}
+
+		TArray<FNiagaraVariable> InputMatches;
+		for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>&
+			MetadataEntry : CalledGraph->GetAllMetaData())
+		{
+			const FNiagaraParameterHandle InputHandle(
+				MetadataEntry.Key.GetName());
+			// Static-switch inputs can be stored without the "Module."
+			// namespace, while ordinary module inputs use it. Match the
+			// leaf name in both representations.
+			if (InputHandle.GetName().ToString().Equals(
+					InputName,
+					ESearchCase::IgnoreCase))
+			{
+				InputMatches.Add(MetadataEntry.Key);
+			}
+		}
+		if (InputMatches.IsEmpty())
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::InputNotFound,
+				FString::Printf(
+					TEXT("Input '%s' was not found on module '%s' in emitter '%s'."),
+					*InputName,
+					*ModuleName,
+					*EmitterName),
+				OutError);
+		}
+		if (InputMatches.Num() > 1)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::InputAmbiguous,
+				FString::Printf(
+					TEXT("Input '%s' occurs %d times on module '%s' in emitter '%s'."),
+					*InputName,
+					InputMatches.Num(),
+					*ModuleName,
+					*EmitterName),
+				OutError);
+		}
+
+		FNiagaraVariable ParsedValue(
+			InputMatches[0].GetType(),
+			NAME_None);
+		ParsedValue.AllocateData();
+		const TSharedPtr<INiagaraEditorTypeUtilities, ESPMode::ThreadSafe>
+			TypeUtilities = FNiagaraEditorModule::Get().GetTypeUtilities(
+				ParsedValue.GetType());
+		const FString RequestedValue = RequestedEdit.Value.TrimStartAndEnd();
+		bool bParsed = TypeUtilities.IsValid()
+			&& TypeUtilities->CanHandlePinDefaults()
+			&& TypeUtilities->SetValueFromPinDefaultString(
+				RequestedValue,
+				ParsedValue);
+		if (!bParsed
+			&& TypeUtilities.IsValid()
+			&& TypeUtilities->CanSetValueFromDisplayName())
+		{
+			bParsed = TypeUtilities->SetValueFromDisplayName(
+				FText::FromString(RequestedValue),
+				ParsedValue);
+		}
+		if (!bParsed)
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::InvalidInputValue,
+				FString::Printf(
+					TEXT("Value '%s' is invalid for module input selector '%s'."),
+					*RequestedValue,
+					*Selector),
+				OutError);
+		}
+
+		ResolvedEdits.Add({
+			FunctionCall,
+			InputMatches[0],
+			TypeUtilities->GetPinDefaultStringFromValue(ParsedValue),
+			Selector});
+	}
+
+	const UEdGraphSchema_Niagara* NiagaraSchema =
+		GetDefault<UEdGraphSchema_Niagara>();
+	System->Modify();
+	for (FUEPyResolvedModuleInputEdit& Edit : ResolvedEdits)
+	{
+		const FNiagaraParameterHandle InputHandle(
+			Edit.InputVariable.GetName());
+		const FNiagaraParameterHandle AliasedInputHandle =
+			FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+				InputHandle,
+				Edit.FunctionCall);
+		Edit.FunctionCall->Modify();
+		Edit.FunctionCall->GetNiagaraGraph()->Modify();
+		UEdGraphPin* OverridePin = &FNiagaraStackGraphUtilities::
+			GetOrCreateStackFunctionInputOverridePin(
+				*Edit.FunctionCall,
+				AliasedInputHandle,
+				Edit.InputVariable.GetType(),
+				FGuid(),
+				FGuid());
+		if (!OverridePin->LinkedTo.IsEmpty())
+		{
+			return Fail(
+				EUEPyNiagaraEditResult::InvalidInputValue,
+				FString::Printf(
+					TEXT("Module input selector '%s' is linked to another node and cannot be replaced with a local value."),
+					*Edit.Selector),
+				OutError);
+		}
+		if (OverridePin->DefaultValue == Edit.CanonicalValue)
+		{
+			continue;
+		}
+
+		NiagaraSchema->TrySetDefaultValue(
+			*OverridePin,
+			Edit.CanonicalValue,
+			true);
+		Edit.FunctionCall->MarkNodeRequiresSynchronization(
+			TEXT("uepy Niagara module input edit"),
+			true);
+		++OutChangedInputCount;
+	}
+
+	if (OutChangedInputCount == 0)
+	{
+		return EUEPyNiagaraEditResult::Success;
+	}
+
+	System->MarkPackageDirty();
+	System->RequestCompile(false);
+	if (!bSave)
+	{
+		return EUEPyNiagaraEditResult::Success;
+	}
+
+	System->WaitForCompilationComplete(false, false);
 	UPackage* Package = System->GetOutermost();
 	const FString PackageName = Package->GetName();
 	const FString PackageFilename = FPackageName::LongPackageNameToFilename(

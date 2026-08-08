@@ -19,6 +19,10 @@ enum class EUEPyNiagaraEditResult : uint8
 	ModuleNotFound = 8,
 	ModuleAmbiguous = 9,
 	SaveFailed = 10,
+	InvalidInputSelector = 11,
+	InputNotFound = 12,
+	InputAmbiguous = 13,
+	InvalidInputValue = 14,
 };
 
 /** Generic editor-only Niagara asset operations exposed to Unreal Python. */
@@ -46,5 +50,20 @@ public:
 		bool bSave,
 		int32& OutChangedEmitterCount,
 		int32& OutChangedModuleCount,
+		FString& OutError);
+
+	/**
+	 * Sets local Niagara module-input values using selectors formatted as
+	 * "EmitterName:ModuleName:InputName". Values may use either Unreal's pin
+	 * default representation or the type's editor display name (for example,
+	 * an enum entry such as "Once"). All selectors and values are validated
+	 * before mutation.
+	 */
+	UFUNCTION(BlueprintCallable, Category="uepy|Assets|Niagara")
+	static EUEPyNiagaraEditResult SetModuleInputValues(
+		const FString& SystemObjectPath,
+		const TMap<FString, FString>& ModuleInputValues,
+		bool bSave,
+		int32& OutChangedInputCount,
 		FString& OutError);
 };
